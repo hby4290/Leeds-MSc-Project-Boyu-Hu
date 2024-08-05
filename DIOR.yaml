@@ -1,0 +1,36 @@
+# segmentation.yaml
+path: /root/DIOR_dataset  # 数据集的根目录路径
+
+# 训练、验证和测试图像的子目录
+train: images/train
+val: images/val
+test: images/test
+
+# 训练、验证和测试的掩码子目录
+labels:
+  train: labels/train
+  val: labels/val
+  test: labels/test
+
+nc: 20
+names:
+  0: airplane
+  1: airport
+  2: baseballfield
+  3: basketballcourt
+  4: bridge
+  5: chimney
+  6: dam
+  7: Expressway-Service-area
+  8: Expressway-toll-station
+  9: golffield
+  10: groundtrackfield
+  11: harbor
+  12: overpass
+  13: ship
+  14: stadium
+  15: storagetank
+  16: tenniscourt
+  17: trainstation
+  18: vehicle
+  19: windmill
