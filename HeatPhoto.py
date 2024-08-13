@@ -142,8 +142,7 @@ class yolov8_heatmap:
 
             # add heatmap and box to image
             cam_image = show_cam_on_image(img.copy(), saliency_map, use_rgb=True)
-            "不想在图片中绘画出边界框和置信度，注释下面的一行代码即可"
-            cam_image = self.draw_detections(post_boxes[i], self.colors[int(post_result[i, :].argmax())],
+                  cam_image = self.draw_detections(post_boxes[i], self.colors[int(post_result[i, :].argmax())],
                                              f'{self.model_names[int(post_result[i, :].argmax())]} {float(post_result[i].max()):.2f}',
                                              cam_image)
             cam_image = Image.fromarray(cam_image)
@@ -152,13 +151,13 @@ class yolov8_heatmap:
 
 def get_params():
     params = {
-        'weight': 'yolov8n.pt',  # 训练出来的权重文件
-        'cfg': 'ultralytics/cfg/models/v8/yolov8n.yaml',  # 训练权重对应的yaml配置文件
+        'weight': 'yolov8n.pt',  
+        'cfg': 'ultralytics/cfg/models/v8/yolov8n.yaml',  
         'device': 'cuda:0',
-        'method': 'GradCAM',  # GradCAMPlusPlus, GradCAM, XGradCAM , 使用的热力图库文件不同的效果不一样可以多尝试
-        'layer': 'model.model[9]',  # 想要检测的对应层
+        'method': 'GradCAM',  
+        'layer': 'model.model[9]',  
         'backward_type': 'box',  # class, box, all
-        'conf_threshold': 0.01,  # 0.6  # 置信度阈值，有的时候你的进度条到一半就停止了就是因为没有高于此值的了
+        'conf_threshold': 0.01,  # 0.6  
         'ratio': 0.02  # 0.02-0.1
     }
     return params
@@ -166,4 +165,4 @@ def get_params():
 
 if __name__ == '__main__':
     model = yolov8_heatmap(**get_params())
-    model(r'ultralytics/assets/bus.jpg', 'result')  # 第一个是检测的文件, 第二个是保存的路径
+    model(r'ultralytics/assets/bus.jpg', 'result') 

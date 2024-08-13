@@ -91,18 +91,14 @@ def run(weights="yolov8n.pt", source="test.mp4", view_img=False, save_img=False,
         results = get_sliced_prediction(
             source, detection_model, slice_height=256, slice_width=256, overlap_height_ratio=0.2, overlap_width_ratio=0.2
         )
-        # 保存检测图片
         results.export_visuals(export_dir="demo_data/")
 
 
         image = cv2.imread('demo_data/prediction_visual.png')
 
-        # 检查是否成功读取图片
         if image is not None:
-            # 显示图片
             cv2.imshow('PNG Image', image)
 
-            # 等待按键输入，并关闭窗口
             cv2.waitKey(0)
             cv2.destroyAllWindows()
         else:
