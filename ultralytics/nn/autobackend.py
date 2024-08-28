@@ -1,5 +1,3 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-
 import ast
 import contextlib
 import json
@@ -20,11 +18,6 @@ from ultralytics.utils.downloads import attempt_download_asset, is_url
 
 
 def check_class_names(names):
-    """
-    Check class names.
-
-    Map imagenet class codes to human-readable names if required. Convert lists to dicts.
-    """
     if isinstance(names, list):  # names is a list
         names = dict(enumerate(names))  # convert to dict
     if isinstance(names, dict):
@@ -43,40 +36,13 @@ def check_class_names(names):
 
 
 def default_class_names(data=None):
-    """Applies default class names to an input YAML file or returns numerical class names."""
     if data:
         with contextlib.suppress(Exception):
             return yaml_load(check_yaml(data))["names"]
     return {i: f"class{i}" for i in range(999)}  # return default if above errors
 
 
-class AutoBackend(nn.Module):
-    """
-    Handles dynamic backend selection for running inference using Ultralytics YOLO models.
-
-    The AutoBackend class is designed to provide an abstraction layer for various inference engines. It supports a wide
-    range of formats, each with specific naming conventions as outlined below:
-
-        Supported Formats and Naming Conventions:
-            | Format                | File Suffix      |
-            |-----------------------|------------------|
-            | PyTorch               | *.pt             |
-            | TorchScript           | *.torchscript    |
-            | ONNX Runtime          | *.onnx           |
-            | ONNX OpenCV DNN       | *.onnx (dnn=True)|
-            | OpenVINO              | *openvino_model/ |
-            | CoreML                | *.mlpackage      |
-            | TensorRT              | *.engine         |
-            | TensorFlow SavedModel | *_saved_model    |
-            | TensorFlow GraphDef   | *.pb             |
-            | TensorFlow Lite       | *.tflite         |
-            | TensorFlow Edge TPU   | *_edgetpu.tflite |
-            | PaddlePaddle          | *_paddle_model   |
-            | ncnn                  | *_ncnn_model     |
-
-    This class offers dynamic backend switching capabilities based on the input model format, making it easier to deploy
-    models across various platforms.
-    """
+class AutoBackend(nn.Module)
 
     @torch.no_grad()
     def __init__(
@@ -89,18 +55,6 @@ class AutoBackend(nn.Module):
         fuse=True,
         verbose=True,
     ):
-        """
-        Initialize the AutoBackend for inference.
-
-        Args:
-            weights (str): Path to the model weights file. Defaults to 'yolov8n.pt'.
-            device (torch.device): Device to run the model on. Defaults to CPU.
-            dnn (bool): Use OpenCV DNN module for ONNX inference. Defaults to False.
-            data (str | Path | optional): Path to the additional data.yaml file containing class names. Optional.
-            fp16 (bool): Enable half-precision inference. Supported only on specific backends. Defaults to False.
-            fuse (bool): Fuse Conv2D + BatchNorm layers for optimization. Defaults to True.
-            verbose (bool): Enable verbose logging. Defaults to True.
-        """
         super().__init__()
         w = str(weights[0] if isinstance(weights, list) else weights)
         nn_module = isinstance(weights, torch.nn.Module)
@@ -193,15 +147,15 @@ class AutoBackend(nn.Module):
             batch_dim = get_batch(ov_model)
             if batch_dim.is_static:
                 batch_size = batch_dim.get_length()
-            ov_compiled_model = core.compile_model(ov_model, device_name="AUTO")  # AUTO selects best available device
+            ov_compiled_model = core.compile_model(ov_model, device_name="AUTO")  
             metadata = w.parent / "metadata.yaml"
         elif engine:  # TensorRT
             LOGGER.info(f"Loading {w} for TensorRT inference...")
             try:
-                import tensorrt as trt  # noqa https://developer.nvidia.com/nvidia-tensorrt-download
+                import tensorrt as trt  
             except ImportError:
                 if LINUX:
-                    check_requirements("nvidia-tensorrt", cmds="-U --index-url https://pypi.ngc.nvidia.com")
+                    check_requirements("nvidia-tensorrt")
                 import tensorrt as trt  # noqa
             check_version(trt.__version__, "7.0.0", hard=True)  # require tensorrt>=7.0.0
             if device.type == "cpu":
@@ -306,7 +260,7 @@ class AutoBackend(nn.Module):
             metadata = w.parents[1] / "metadata.yaml"
         elif ncnn:  # ncnn
             LOGGER.info(f"Loading {w} for ncnn inference...")
-            check_requirements("git+https://github.com/Tencent/ncnn.git" if ARM64 else "ncnn")  # requires ncnn
+            check_requirements(if ARM64 else "ncnn")  # requires ncnn
             import ncnn as pyncnn
 
             net = pyncnn.Net()
@@ -347,8 +301,6 @@ class AutoBackend(nn.Module):
             names = metadata["names"]
             kpt_shape = metadata.get("kpt_shape")
         elif not (pt or triton or nn_module):
-            LOGGER.warning(f"WARNING ⚠️ Metadata not found for 'model={weights}'")
-
         # Check names
         if "names" not in locals():  # names missing
             names = default_class_names(data)
@@ -362,18 +314,6 @@ class AutoBackend(nn.Module):
         self.__dict__.update(locals())  # assign all variables to self
 
     def forward(self, im, augment=False, visualize=False, embed=None):
-        """
-        Runs inference on the YOLOv8 MultiBackend model.
-
-        Args:
-            im (torch.Tensor): The image tensor to perform inference on.
-            augment (bool): whether to perform data augmentation during inference, defaults to False
-            visualize (bool): whether to visualize the output predictions, defaults to False
-            embed (list, optional): A list of feature vectors/embeddings to return.
-
-        Returns:
-            (tuple): Tuple containing the raw output tensor, and processed output for visualization (if visualize=True)
-        """
         b, ch, h, w = im.shape  # batch, channel, height, width
         if self.fp16 and im.dtype != torch.float16:
             im = im.half()  # to FP16
@@ -417,11 +357,6 @@ class AutoBackend(nn.Module):
                     "Ultralytics only supports inference of non-pipelined CoreML models exported with "
                     f"'nms=False', but 'model={w}' has an NMS pipeline created by an 'nms=True' export."
                 )
-                # TODO: CoreML NMS inference handling
-                # from ultralytics.utils.ops import xywh2xyxy
-                # box = xywh2xyxy(y['coordinates'] * [[w, h, w, h]])  # xyxy pixels
-                # conf, cls = y['confidence'].max(1), y['confidence'].argmax(1).astype(np.float32)
-                # y = np.concatenate((box, conf.reshape(-1, 1), cls.reshape(-1, 1)), 1)
             elif len(y) == 1:  # classification model
                 y = list(y.values())
             elif len(y) == 2:  # segmentation model
@@ -471,8 +406,6 @@ class AutoBackend(nn.Module):
                         scale, zero_point = output["quantization"]
                         x = (x.astype(np.float32) - zero_point) * scale  # re-scale
                     if x.ndim > 2:  # if task is not classification
-                        # Denormalize xywh by image size. See https://github.com/ultralytics/ultralytics/pull/1695
-                        # xywh are normalized in TFLite/EdgeTPU to mitigate quantization error of integer models
                         x[:, [0, 2]] *= w
                         x[:, [1, 3]] *= h
                     y.append(x)
@@ -483,35 +416,15 @@ class AutoBackend(nn.Module):
                 y[1] = np.transpose(y[1], (0, 3, 1, 2))  # should be y = (1, 116, 8400), (1, 32, 160, 160)
             y = [x if isinstance(x, np.ndarray) else x.numpy() for x in y]
 
-        # for x in y:
-        #     print(type(x), len(x)) if isinstance(x, (list, tuple)) else print(type(x), x.shape)  # debug shapes
         if isinstance(y, (list, tuple)):
             return self.from_numpy(y[0]) if len(y) == 1 else [self.from_numpy(x) for x in y]
         else:
             return self.from_numpy(y)
 
     def from_numpy(self, x):
-        """
-        Convert a numpy array to a tensor.
-
-        Args:
-            x (np.ndarray): The array to be converted.
-
-        Returns:
-            (torch.Tensor): The converted tensor
-        """
         return torch.tensor(x).to(self.device) if isinstance(x, np.ndarray) else x
 
     def warmup(self, imgsz=(1, 3, 640, 640)):
-        """
-        Warm up the model by running one forward pass with a dummy input.
-
-        Args:
-            imgsz (tuple): The shape of the dummy input tensor in the format (batch_size, channels, height, width)
-
-        Returns:
-            (None): This method runs the forward pass and don't return any value
-        """
         warmup_types = self.pt, self.jit, self.onnx, self.engine, self.saved_model, self.pb, self.triton, self.nn_module
         if any(warmup_types) and (self.device.type != "cpu" or self.triton):
             im = torch.empty(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)  # input
@@ -520,14 +433,6 @@ class AutoBackend(nn.Module):
 
     @staticmethod
     def _model_type(p="path/to/model.pt"):
-        """
-        This function takes a path to a model file and returns the model type.
-
-        Args:
-            p: path to the model file. Defaults to path/to/model.pt
-        """
-        # Return model type from model path, i.e. path='path/to/model.onnx' -> type=onnx
-        # types = [pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle]
         from ultralytics.engine.exporter import export_formats
 
         sf = list(export_formats().Suffix)  # export suffixes
