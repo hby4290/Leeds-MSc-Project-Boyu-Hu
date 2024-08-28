@@ -1,6 +1,3 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-"""Model head modules."""
-
 import math
 
 import torch
@@ -61,9 +58,7 @@ class Detect(nn.Module):
             box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
         dbox = self.decode_bboxes(box)
 
-        if self.export and self.format in ("tflite", "edgetpu"):
-            # Precompute normalization factor to increase numerical stability
-            # See https://github.com/ultralytics/ultralytics/issues/7371
+        if self.export and self.format in ("tflite", "edgetpu"):1
             img_h = shape[2]
             img_w = shape[3]
             img_size = torch.tensor([img_w, img_h, img_w, img_h], device=box.device).reshape(1, 4, 1)
@@ -74,10 +69,7 @@ class Detect(nn.Module):
         return y if self.export else (y, x)
 
     def bias_init(self):
-        """Initialize Detect() biases, WARNING: requires stride availability."""
         m = self  # self.model[-1]  # Detect() module
-        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
-        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
         for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
             a[-1].bias.data[:] = 1.0  # box
             b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
@@ -208,14 +200,6 @@ class Classify(nn.Module):
 
 
 class RTDETRDecoder(nn.Module):
-    """
-    Real-Time Deformable Transformer Decoder (RTDETRDecoder) module for object detection.
-
-    This decoder module utilizes Transformer architecture along with deformable convolutions to predict bounding boxes
-    and class labels for objects in an image. It integrates features from multiple layers and runs through a series of
-    Transformer decoder layers to output the final predictions.
-    """
-
     export = False  # export mode
 
     def __init__(
@@ -237,26 +221,6 @@ class RTDETRDecoder(nn.Module):
         box_noise_scale=1.0,
         learnt_init_query=False,
     ):
-        """
-        Initializes the RTDETRDecoder module with the given parameters.
-
-        Args:
-            nc (int): Number of classes. Default is 80.
-            ch (tuple): Channels in the backbone feature maps. Default is (512, 1024, 2048).
-            hd (int): Dimension of hidden layers. Default is 256.
-            nq (int): Number of query points. Default is 300.
-            ndp (int): Number of decoder points. Default is 4.
-            nh (int): Number of heads in multi-head attention. Default is 8.
-            ndl (int): Number of decoder layers. Default is 6.
-            d_ffn (int): Dimension of the feed-forward networks. Default is 1024.
-            dropout (float): Dropout rate. Default is 0.
-            act (nn.Module): Activation function. Default is nn.ReLU.
-            eval_idx (int): Evaluation index. Default is -1.
-            nd (int): Number of denoising. Default is 100.
-            label_noise_ratio (float): Label noise ratio. Default is 0.5.
-            box_noise_scale (float): Box noise scale. Default is 1.0.
-            learnt_init_query (bool): Whether to learn initial query embeddings. Default is False.
-        """
         super().__init__()
         self.hidden_dim = hd
         self.nhead = nh
