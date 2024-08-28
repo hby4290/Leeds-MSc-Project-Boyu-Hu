@@ -1,11 +1,4 @@
-# -*- coding: utf-8 -*-
-# -----------------------------------------------------
-# Time :  2023/2/27 11:28
-# Auth :  Written by zuofengyuan
-# File :  统计coco信息.py
-# Copyright (c) Shenyang Pedlin Technolofy Co., Ltd.
-# -----------------------------------------------------
-"""
+
  Description: TODO
 """
 from pycocotools.coco import COCO
