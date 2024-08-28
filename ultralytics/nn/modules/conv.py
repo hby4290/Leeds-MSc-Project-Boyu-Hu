@@ -1,6 +1,3 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-"""Convolution modules."""
-
 import math
 
 import numpy as np
@@ -34,7 +31,6 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
 
 
 class Conv(nn.Module):
-    """Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)."""
 
     default_act = nn.SiLU()  # default activation
 
@@ -173,13 +169,6 @@ class GhostConv(nn.Module):
 
 
 class RepConv(nn.Module):
-    """
-    RepConv is a basic rep-style block, including training and deploy status.
-
-    This module is used in RT-DETR.
-    Based on https://github.com/DingXiaoH/RepVGG/blob/main/repvgg.py
-    """
-
     default_act = nn.SiLU()  # default activation
 
     def __init__(self, c1, c2, k=3, s=1, p=1, g=1, d=1, act=True, bn=False, deploy=False):
@@ -276,8 +265,6 @@ class RepConv(nn.Module):
 
 
 class ChannelAttention(nn.Module):
-    """Channel-attention module https://github.com/open-mmlab/mmdetection/tree/v3.0.0rc1/configs/rtmdet."""
-
     def __init__(self, channels: int) -> None:
         """Initializes the class and sets the basic configurations and instance variables required."""
         super().__init__()
