@@ -1,9 +1,6 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-# YOLOv5 object detection model with P3-P5 outputs. For details see https://docs.ultralytics.com/models/yolov5
-
 # Parameters
 nc: 80  # number of classes
-scales: # model compound scaling constants, i.e. 'model=yolov5n.yaml' will call yolov5.yaml with scale 'n'
+scales:
   # [depth, width, max_channels]
   n: [0.33, 0.25, 1024]
   s: [0.33, 0.50, 1024]
