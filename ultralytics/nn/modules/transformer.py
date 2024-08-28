@@ -1,6 +1,3 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-"""Transformer modules."""
-
 import math
 
 import torch
@@ -116,7 +113,6 @@ class AIFI(TransformerEncoderLayer):
 
 
 class TransformerLayer(nn.Module):
-    """Transformer layer https://arxiv.org/abs/2010.11929 (LayerNorm layers removed for better performance)."""
 
     def __init__(self, c, num_heads):
         """Initializes a self-attention mechanism using linear transformations and multi-head attention."""
@@ -135,7 +131,6 @@ class TransformerLayer(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Vision Transformer https://arxiv.org/abs/2010.11929."""
 
     def __init__(self, c1, c2, num_heads, num_layers):
         """Initialize a Transformer module with position embedding and specified number of heads and layers."""
@@ -189,14 +184,6 @@ class MLP(nn.Module):
 
 
 class LayerNorm2d(nn.Module):
-    """
-    2D Layer Normalization module inspired by Detectron2 and ConvNeXt implementations.
-
-    Original implementations in
-    https://github.com/facebookresearch/detectron2/blob/main/detectron2/layers/batch_norm.py
-    and
-    https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py.
-    """
 
     def __init__(self, num_channels, eps=1e-6):
         """Initialize LayerNorm2d with the given parameters."""
@@ -214,11 +201,6 @@ class LayerNorm2d(nn.Module):
 
 
 class MSDeformAttn(nn.Module):
-    """
-    Multi-Scale Deformable Attention Module based on Deformable-DETR and PaddleDetection implementations.
-
-    https://github.com/fundamentalvision/Deformable-DETR/blob/main/models/ops/modules/ms_deform_attn.py
-    """
 
     def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4):
         """Initialize MSDeformAttn with the given parameters."""
@@ -265,22 +247,6 @@ class MSDeformAttn(nn.Module):
         constant_(self.output_proj.bias.data, 0.0)
 
     def forward(self, query, refer_bbox, value, value_shapes, value_mask=None):
-        """
-        Perform forward pass for multiscale deformable attention.
-
-        https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/transformers/deformable_transformer.py
-
-        Args:
-            query (torch.Tensor): [bs, query_length, C]
-            refer_bbox (torch.Tensor): [bs, query_length, n_levels, 2], range in [0, 1], top-left (0,0),
-                bottom-right (1, 1), including padding area
-            value (torch.Tensor): [bs, value_length, C]
-            value_shapes (List): [n_levels, 2], [(H_0, W_0), (H_1, W_1), ..., (H_{L-1}, W_{L-1})]
-            value_mask (Tensor): [bs, value_length], True for non-padding elements, False for padding elements
-
-        Returns:
-            output (Tensor): [bs, Length_{query}, C]
-        """
         bs, len_q = query.shape[:2]
         len_v = value.shape[1]
         assert sum(s[0] * s[1] for s in value_shapes) == len_v
@@ -308,13 +274,6 @@ class MSDeformAttn(nn.Module):
 
 
 class DeformableTransformerDecoderLayer(nn.Module):
-    """
-    Deformable Transformer Decoder Layer inspired by PaddleDetection and Deformable-DETR implementations.
-
-    https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/transformers/deformable_transformer.py
-    https://github.com/fundamentalvision/Deformable-DETR/blob/main/models/deformable_transformer.py
-    """
-
     def __init__(self, d_model=256, n_heads=8, d_ffn=1024, dropout=0.0, act=nn.ReLU(), n_levels=4, n_points=4):
         """Initialize the DeformableTransformerDecoderLayer with the given parameters."""
         super().__init__()
@@ -371,11 +330,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
 
 class DeformableTransformerDecoder(nn.Module):
-    """
-    Implementation of Deformable Transformer Decoder based on PaddleDetection.
-
-    https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/transformers/deformable_transformer.py
-    """
 
     def __init__(self, hidden_dim, decoder_layer, num_layers, eval_idx=-1):
         """Initialize the DeformableTransformerDecoder with the given parameters."""
