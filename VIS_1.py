@@ -1,4 +1,3 @@
-# by https://blog.csdn.net/weixin_43694096
 import cv2
 import numpy as np
 
