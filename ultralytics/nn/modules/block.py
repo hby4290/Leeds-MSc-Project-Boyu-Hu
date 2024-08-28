@@ -1,6 +1,3 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-"""Block modules."""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -53,14 +50,7 @@ class DFL(nn.Module):
 
 
 class Proto(nn.Module):
-    """YOLOv8 mask Proto module for segmentation models."""
-
     def __init__(self, c1, c_=256, c2=32):
-        """
-        Initializes the YOLOv8 mask Proto module with specified number of protos and masks.
-
-        Input arguments are ch_in, number of protos, number of masks.
-        """
         super().__init__()
         self.cv1 = Conv(c1, c_, k=3)
         self.upsample = nn.ConvTranspose2d(c_, c_, 2, 2, 0, bias=True)  # nn.Upsample(scale_factor=2, mode='nearest')
@@ -68,19 +58,11 @@ class Proto(nn.Module):
         self.cv3 = Conv(c_, c2)
 
     def forward(self, x):
-        """Performs a forward pass through layers using an upsampled input image."""
         return self.cv3(self.cv2(self.upsample(self.cv1(x))))
 
 
 class HGStem(nn.Module):
-    """
-    StemBlock of PPHGNetV2 with 5 convolutions and one maxpool2d.
-
-    https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/backbones/hgnet_v2.py
-    """
-
     def __init__(self, c1, cm, c2):
-        """Initialize the SPP layer with input/output channels and specified kernel sizes for max pooling."""
         super().__init__()
         self.stem1 = Conv(c1, cm, 3, 2, act=nn.ReLU())
         self.stem2a = Conv(cm, cm // 2, 2, 1, 0, act=nn.ReLU())
@@ -90,7 +72,6 @@ class HGStem(nn.Module):
         self.pool = nn.MaxPool2d(kernel_size=2, stride=1, padding=0, ceil_mode=True)
 
     def forward(self, x):
-        """Forward pass of a PPHGNetV2 backbone layer."""
         x = self.stem1(x)
         x = F.pad(x, [0, 1, 0, 1])
         x2 = self.stem2a(x)
@@ -104,14 +85,7 @@ class HGStem(nn.Module):
 
 
 class HGBlock(nn.Module):
-    """
-    HG_Block of PPHGNetV2 with 2 convolutions and LightConv.
-
-    https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/backbones/hgnet_v2.py
-    """
-
     def __init__(self, c1, cm, c2, k=3, n=6, lightconv=False, shortcut=False, act=nn.ReLU()):
-        """Initializes a CSP Bottleneck with 1 convolution using specified input and output channels."""
         super().__init__()
         block = LightConv if lightconv else Conv
         self.m = nn.ModuleList(block(c1 if i == 0 else cm, cm, k=k, act=act) for i in range(n))
@@ -120,7 +94,6 @@ class HGBlock(nn.Module):
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
-        """Forward pass of a PPHGNetV2 backbone layer."""
         y = [x]
         y.extend(m(y[-1]) for m in self.m)
         y = self.ec(self.sc(torch.cat(y, 1)))
@@ -128,10 +101,7 @@ class HGBlock(nn.Module):
 
 
 class SPP(nn.Module):
-    """Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729."""
-
     def __init__(self, c1, c2, k=(5, 9, 13)):
-        """Initialize the SPP layer with input/output channels and pooling kernel sizes."""
         super().__init__()
         c_ = c1 // 2  # hidden channels
         self.cv1 = Conv(c1, c_, 1, 1)
@@ -139,7 +109,6 @@ class SPP(nn.Module):
         self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
 
     def forward(self, x):
-        """Forward pass of the SPP layer, performing spatial pyramid pooling."""
         x = self.cv1(x)
         return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
 
@@ -148,11 +117,6 @@ class SPPF(nn.Module):
     """Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher."""
 
     def __init__(self, c1, c2, k=5):
-        """
-        Initializes the SPPF layer with given input/output channels and kernel size.
-
-        This module is equivalent to SPP(k=(5, 9, 13)).
-        """
         super().__init__()
         c_ = c1 // 2  # hidden channels
         self.cv1 = Conv(c1, c_, 1, 1)
@@ -168,8 +132,6 @@ class SPPF(nn.Module):
 
 
 class C1(nn.Module):
-    """CSP Bottleneck with 1 convolution."""
-
     def __init__(self, c1, c2, n=1):
         """Initializes the CSP Bottleneck with configurations for 1 convolution with arguments ch_in, ch_out, number."""
         super().__init__()
@@ -183,12 +145,8 @@ class C1(nn.Module):
 
 
 class C2(nn.Module):
-    """CSP Bottleneck with 2 convolutions."""
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
-        """Initializes the CSP Bottleneck with 2 convolutions module with arguments ch_in, ch_out, number, shortcut,
-        groups, expansion.
-        """
         super().__init__()
         self.c = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
@@ -197,18 +155,13 @@ class C2(nn.Module):
         self.m = nn.Sequential(*(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n)))
 
     def forward(self, x):
-        """Forward pass through the CSP bottleneck with 2 convolutions."""
         a, b = self.cv1(x).chunk(2, 1)
         return self.cv2(torch.cat((self.m(a), b), 1))
 
 
 class C2f(nn.Module):
-    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
-        """Initialize CSP bottleneck layer with two convolutions with arguments ch_in, ch_out, number, shortcut, groups,
-        expansion.
-        """
         super().__init__()
         self.c = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
@@ -216,23 +169,19 @@ class C2f(nn.Module):
         self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
 
     def forward(self, x):
-        """Forward pass through C2f layer."""
         y = list(self.cv1(x).chunk(2, 1))
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
 
     def forward_split(self, x):
-        """Forward pass using split() instead of chunk()."""
         y = list(self.cv1(x).split((self.c, self.c), 1))
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
 
 
 class C3(nn.Module):
-    """CSP Bottleneck with 3 convolutions."""
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
-        """Initialize the CSP Bottleneck with given channels, number, shortcut, groups, and expansion values."""
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, c_, 1, 1)
@@ -241,12 +190,10 @@ class C3(nn.Module):
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=((1, 1), (3, 3)), e=1.0) for _ in range(n)))
 
     def forward(self, x):
-        """Forward pass through the CSP bottleneck with 2 convolutions."""
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
 
 class C3x(C3):
-    """C3 module with cross-convolutions."""
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
         """Initialize C3TR instance and set default parameters."""
@@ -259,7 +206,6 @@ class RepC3(nn.Module):
     """Rep C3."""
 
     def __init__(self, c1, c2, n=3, e=1.0):
-        """Initialize CSP Bottleneck with a single convolution using input channels, output channels, and number."""
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, c2, 1, 1)
@@ -268,12 +214,10 @@ class RepC3(nn.Module):
         self.cv3 = Conv(c_, c2, 1, 1) if c_ != c2 else nn.Identity()
 
     def forward(self, x):
-        """Forward pass of RT-DETR neck layer."""
         return self.cv3(self.m(self.cv1(x)) + self.cv2(x))
 
 
 class C3TR(C3):
-    """C3 module with TransformerBlock()."""
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
         """Initialize C3Ghost module with GhostBottleneck()."""
@@ -283,7 +227,6 @@ class C3TR(C3):
 
 
 class C3Ghost(C3):
-    """C3 module with GhostBottleneck()."""
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
         """Initialize 'SPP' module with various pooling sizes for spatial pyramid pooling."""
@@ -293,10 +236,8 @@ class C3Ghost(C3):
 
 
 class GhostBottleneck(nn.Module):
-    """Ghost Bottleneck https://github.com/huawei-noah/ghostnet."""
 
     def __init__(self, c1, c2, k=3, s=1):
-        """Initializes GhostBottleneck module with arguments ch_in, ch_out, kernel, stride."""
         super().__init__()
         c_ = c2 // 2
         self.conv = nn.Sequential(
@@ -309,17 +250,12 @@ class GhostBottleneck(nn.Module):
         )
 
     def forward(self, x):
-        """Applies skip connection and concatenation to input tensor."""
         return self.conv(x) + self.shortcut(x)
 
 
 class Bottleneck(nn.Module):
-    """Standard bottleneck."""
 
     def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
-        """Initializes a bottleneck module with given input/output channels, shortcut option, group, kernels, and
-        expansion.
-        """
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, c_, k[0], 1)
@@ -327,15 +263,12 @@ class Bottleneck(nn.Module):
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
-        """'forward()' applies the YOLO FPN to input data."""
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
 class BottleneckCSP(nn.Module):
-    """CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks."""
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
-        """Initializes the CSP Bottleneck given arguments for ch_in, ch_out, number, shortcut, groups, expansion."""
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, c_, 1, 1)
@@ -347,17 +280,14 @@ class BottleneckCSP(nn.Module):
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
     def forward(self, x):
-        """Applies a CSP bottleneck with 3 convolutions."""
         y1 = self.cv3(self.m(self.cv1(x)))
         y2 = self.cv2(x)
         return self.cv4(self.act(self.bn(torch.cat((y1, y2), 1))))
 
 
 class ResNetBlock(nn.Module):
-    """ResNet block with standard convolution layers."""
 
     def __init__(self, c1, c2, s=1, e=4):
-        """Initialize convolution with given parameters."""
         super().__init__()
         c3 = e * c2
         self.cv1 = Conv(c1, c2, k=1, s=1, act=True)
@@ -366,13 +296,10 @@ class ResNetBlock(nn.Module):
         self.shortcut = nn.Sequential(Conv(c1, c3, k=1, s=s, act=False)) if s != 1 or c1 != c3 else nn.Identity()
 
     def forward(self, x):
-        """Forward pass through the ResNet block."""
         return F.relu(self.cv3(self.cv2(self.cv1(x))) + self.shortcut(x))
 
 
 class ResNetLayer(nn.Module):
-    """ResNet layer with multiple ResNet blocks."""
-
     def __init__(self, c1, c2, s=1, is_first=False, n=1, e=4):
         """Initializes the ResNetLayer given arguments."""
         super().__init__()
