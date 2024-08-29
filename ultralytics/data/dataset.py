@@ -1,370 +1,320 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-import contextlib
-from itertools import repeat
-from multiprocessing.pool import ThreadPool
-from pathlib import Path
-
+import os
 import cv2
 import numpy as np
-import torch
-import torchvision
+from pathlib import Path
+from multiprocessing.pool import ThreadPool
 from PIL import Image
+import torch
+from torch.utils.data import Dataset
+from torchvision import transforms as T
 
-from ultralytics.utils import LOCAL_RANK, NUM_THREADS, TQDM, colorstr, is_dir_writeable
-from ultralytics.utils.ops import resample_segments
-from .augment import Compose, Format, Instances, LetterBox, classify_augmentations, classify_transforms, v8_transforms
-from .base import BaseDataset
-from .utils import HELP_URL, LOGGER, get_hash, img2label_paths, verify_image, verify_image_label
+# Constants for cache versioning
+CACHE_VERSION = "1.1.0"
 
-# Ultralytics dataset *.cache version, >= 1.0.0 for YOLOv8
-DATASET_CACHE_VERSION = "1.0.3"
+class YOLODataset(Dataset):
 
-
-class YOLODataset(BaseDataset):
-    """
-    Dataset class for loading object detection and/or segmentation labels in YOLO format.
-
-    Args:
-        data (dict, optional): A dataset YAML dictionary. Defaults to None.
-        task (str): An explicit arg to point current task, Defaults to 'detect'.
-
-    Returns:
-        (torch.utils.data.Dataset): A PyTorch dataset object that can be used for training an object detection model.
-    """
-
-    def __init__(self, *args, data=None, task="detect", **kwargs):
-        """Initializes the YOLODataset with optional configurations for segments and keypoints."""
-        self.use_segments = task == "segment"
-        self.use_keypoints = task == "pose"
-        self.use_obb = task == "obb"
-        self.data = data
-        assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
-        super().__init__(*args, **kwargs)
-
-    def cache_labels(self, path=Path("./labels.cache")):
+    def __init__(self, data_config=None, task_type="detection", **kwargs):
         """
-        Cache dataset labels, check images and read shapes.
+        Initializes the YOLODataset with configurations for detection, segmentation, or keypoint tasks.
 
         Args:
-            path (Path): path where to save the cache file (default: Path('./labels.cache')).
+            data_config (dict, optional): Configuration dictionary containing dataset paths and parameters.
+            task_type (str): Defines the type of task - 'detection', 'segmentation', or 'keypoints'.
+        """
+        self.task_type = task_type
+        self.data_config = data_config
+        self.use_keypoints = task_type == "keypoints"
+        self.use_segmentation = task_type == "segmentation"
+        super().__init__(**kwargs)
+
+    def cache_data(self, cache_path="./data_cache.cache"):
+        """
+        Caches dataset labels and image metadata to improve loading efficiency.
+
+        Args:
+            cache_path (str): Path where the cache file should be saved.
+
         Returns:
-            (dict): labels.
+            dict: Cached dataset information including labels and image shapes.
         """
-        x = {"labels": []}
-        nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
-        desc = f"{self.prefix}Scanning {path.parent / path.stem}..."
-        total = len(self.im_files)
-        nkpt, ndim = self.data.get("kpt_shape", (0, 0))
-        if self.use_keypoints and (nkpt <= 0 or ndim not in (2, 3)):
-            raise ValueError(
-                "'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
-                "keypoints, number of dims (2 for x,y or 3 for x,y,visible)], i.e. 'kpt_shape: [17, 3]'"
-            )
-        with ThreadPool(NUM_THREADS) as pool:
-            results = pool.imap(
-                func=verify_image_label,
-                iterable=zip(
-                    self.im_files,
-                    self.label_files,
-                    repeat(self.prefix),
-                    repeat(self.use_keypoints),
-                    repeat(len(self.data["names"])),
-                    repeat(nkpt),
-                    repeat(ndim),
-                ),
-            )
-            pbar = TQDM(results, desc=desc, total=total)
-            for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
-                nm += nm_f
-                nf += nf_f
-                ne += ne_f
-                nc += nc_f
-                if im_file:
-                    x["labels"].append(
-                        dict(
-                            im_file=im_file,
-                            shape=shape,
-                            cls=lb[:, 0:1],  # n, 1
-                            bboxes=lb[:, 1:],  # n, 4
-                            segments=segments,
-                            keypoints=keypoint,
-                            normalized=True,
-                            bbox_format="xywh",
-                        )
-                    )
-                if msg:
-                    msgs.append(msg)
-                pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
-            pbar.close()
+        cache = {"labels": []}
+        nm, nf, ne, nc = 0, 0, 0, 0  # counters for missing, found, empty, corrupt
+        image_files = self.data_config["image_files"]
+        total_images = len(image_files)
 
-        if msgs:
-            LOGGER.info("\n".join(msgs))
-        if nf == 0:
-            LOGGER.warning(f"{self.prefix}WARNING ⚠️ No labels found in {path}. {HELP_URL}")
-        x["hash"] = get_hash(self.label_files + self.im_files)
-        x["results"] = nf, nm, ne, nc, len(self.im_files)
-        x["msgs"] = msgs  # warnings
-        save_dataset_cache_file(self.prefix, path, x)
-        return x
+        with ThreadPool(os.cpu_count()) as pool:
+            results = pool.imap(self._verify_image_and_label, image_files)
+            for result in results:
+                im_file, label_data, status = result
+                if status == "found":
+                    nf += 1
+                    cache["labels"].append(label_data)
+                elif status == "missing":
+                    nm += 1
+                elif status == "empty":
+                    ne += 1
+                elif status == "corrupt":
+                    nc += 1
 
-    def get_labels(self):
-        """Returns dictionary of labels for YOLO training."""
-        self.label_files = img2label_paths(self.im_files)
-        cache_path = Path(self.label_files[0]).parent.with_suffix(".cache")
-        try:
-            cache, exists = load_dataset_cache_file(cache_path), True  # attempt to load a *.cache file
-            assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
-            assert cache["hash"] == get_hash(self.label_files + self.im_files)  # identical hash
-        except (FileNotFoundError, AssertionError, AttributeError):
-            cache, exists = self.cache_labels(cache_path), False  # run cache ops
+        cache["hash"] = self._generate_hash(image_files)
+        cache["summary"] = (nf, nm, ne, nc, total_images)
+        self._save_cache(cache_path, cache)
+        return cache
 
-        # Display cache
-        nf, nm, ne, nc, n = cache.pop("results")  # found, missing, empty, corrupt, total
-        if exists and LOCAL_RANK in (-1, 0):
-            d = f"Scanning {cache_path}... {nf} images, {nm + ne} backgrounds, {nc} corrupt"
-            TQDM(None, desc=self.prefix + d, total=n, initial=n)  # display results
-            if cache["msgs"]:
-                LOGGER.info("\n".join(cache["msgs"]))  # display warnings
-
-        # Read cache
-        [cache.pop(k) for k in ("hash", "version", "msgs")]  # remove items
-        labels = cache["labels"]
-        if not labels:
-            LOGGER.warning(f"WARNING ⚠️ No images found in {cache_path}, training may not work correctly. {HELP_URL}")
-        self.im_files = [lb["im_file"] for lb in labels]  # update im_files
-
-        # Check if the dataset is all boxes or all segments
-        lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
-        len_cls, len_boxes, len_segments = (sum(x) for x in zip(*lengths))
-        if len_segments and len_boxes != len_segments:
-            LOGGER.warning(
-                f"WARNING ⚠️ Box and segment counts should be equal, but got len(segments) = {len_segments}, "
-                f"len(boxes) = {len_boxes}. To resolve this only boxes will be used and all segments will be removed. "
-                "To avoid this please supply either a detect or segment dataset, not a detect-segment mixed dataset."
-            )
-            for lb in labels:
-                lb["segments"] = []
-        if len_cls == 0:
-            LOGGER.warning(f"WARNING ⚠️ No labels found in {cache_path}, training may not work correctly. {HELP_URL}")
-        return labels
-
-    def build_transforms(self, hyp=None):
-        """Builds and appends transforms to the list."""
-        if self.augment:
-            hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
-            hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
-            transforms = v8_transforms(self, self.imgsz, hyp)
-        else:
-            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
-        transforms.append(
-            Format(
-                bbox_format="xywh",
-                normalize=True,
-                return_mask=self.use_segments,
-                return_keypoint=self.use_keypoints,
-                return_obb=self.use_obb,
-                batch_idx=True,
-                mask_ratio=hyp.mask_ratio,
-                mask_overlap=hyp.overlap_mask,
-            )
-        )
-        return transforms
-
-    def close_mosaic(self, hyp):
-        """Sets mosaic, copy_paste and mixup options to 0.0 and builds transformations."""
-        hyp.mosaic = 0.0  # set mosaic ratio=0.0
-        hyp.copy_paste = 0.0  # keep the same behavior as previous v8 close-mosaic
-        hyp.mixup = 0.0  # keep the same behavior as previous v8 close-mosaic
-        self.transforms = self.build_transforms(hyp)
-
-    def update_labels_info(self, label):
-        """Custom your label format here."""
-        # NOTE: cls is not with bboxes now, classification and semantic segmentation need an independent cls label
-        # We can make it also support classification and semantic segmentation by add or remove some dict keys there.
-        bboxes = label.pop("bboxes")
-        segments = label.pop("segments", [])
-        keypoints = label.pop("keypoints", None)
-        bbox_format = label.pop("bbox_format")
-        normalized = label.pop("normalized")
-
-        # NOTE: do NOT resample oriented boxes
-        segment_resamples = 100 if self.use_obb else 1000
-        if len(segments) > 0:
-            # list[np.array(1000, 2)] * num_samples
-            # (N, 1000, 2)
-            segments = np.stack(resample_segments(segments, n=segment_resamples), axis=0)
-        else:
-            segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
-        label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
-        return label
-
-    @staticmethod
-    def collate_fn(batch):
-        """Collates data samples into batches."""
-        new_batch = {}
-        keys = batch[0].keys()
-        values = list(zip(*[list(b.values()) for b in batch]))
-        for i, k in enumerate(keys):
-            value = values[i]
-            if k == "img":
-                value = torch.stack(value, 0)
-            if k in ["masks", "keypoints", "bboxes", "cls", "segments", "obb"]:
-                value = torch.cat(value, 0)
-            new_batch[k] = value
-        new_batch["batch_idx"] = list(new_batch["batch_idx"])
-        for i in range(len(new_batch["batch_idx"])):
-            new_batch["batch_idx"][i] += i  # add target image index for build_targets()
-        new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
-        return new_batch
-
-
-# Classification dataloaders -------------------------------------------------------------------------------------------
-class ClassificationDataset(torchvision.datasets.ImageFolder):
-    """
-    YOLO Classification Dataset.
-
-    Args:
-        root (str): Dataset path.
-
-    Attributes:
-        cache_ram (bool): True if images should be cached in RAM, False otherwise.
-        cache_disk (bool): True if images should be cached on disk, False otherwise.
-        samples (list): List of samples containing file, index, npy, and im.
-        torch_transforms (callable): torchvision transforms applied to the dataset.
-        album_transforms (callable, optional): Albumentations transforms applied to the dataset if augment is True.
-    """
-
-    def __init__(self, root, args, augment=False, cache=False, prefix=""):
+    def _verify_image_and_label(self, im_file):
         """
-        Initialize YOLO object with root, image size, augmentations, and cache settings.
+        Verifies the existence and integrity of an image and its corresponding label.
 
         Args:
-            root (str): Dataset path.
-            args (Namespace): Argument parser containing dataset related settings.
-            augment (bool, optional): True if dataset should be augmented, False otherwise. Defaults to False.
-            cache (bool | str | optional): Cache setting, can be True, False, 'ram' or 'disk'. Defaults to False.
+            im_file (str): Path to the image file.
+
+        Returns:
+            tuple: Image file path, label data, and status of verification.
         """
-        super().__init__(root=root)
-        if augment and args.fraction < 1.0:  # reduce training fraction
-            self.samples = self.samples[: round(len(self.samples) * args.fraction)]
-        self.prefix = colorstr(f"{prefix}: ") if prefix else ""
-        self.cache_ram = cache is True or cache == "ram"
-        self.cache_disk = cache == "disk"
-        self.samples = self.verify_images()  # filter out bad images
-        self.samples = [list(x) + [Path(x[0]).with_suffix(".npy"), None] for x in self.samples]  # file, index, npy, im
-        scale = (1.0 - args.scale, 1.0)  # (0.08, 1.0)
-        self.torch_transforms = (
-            classify_augmentations(
-                size=args.imgsz,
-                scale=scale,
-                hflip=args.fliplr,
-                vflip=args.flipud,
-                erasing=args.erasing,
-                auto_augment=args.auto_augment,
-                hsv_h=args.hsv_h,
-                hsv_s=args.hsv_s,
-                hsv_v=args.hsv_v,
-            )
-            if augment
-            else classify_transforms(size=args.imgsz, crop_fraction=args.crop_fraction)
-        )
+        label_file = self._get_label_path(im_file)
+        if not os.path.exists(im_file) or not os.path.exists(label_file):
+            return im_file, None, "missing"
 
-    def __getitem__(self, i):
-        """Returns subset of data and targets corresponding to given indices."""
-        f, j, fn, im = self.samples[i]  # filename, index, filename.with_suffix('.npy'), image
-        if self.cache_ram and im is None:
-            im = self.samples[i][3] = cv2.imread(f)
-        elif self.cache_disk:
-            if not fn.exists():  # load npy
-                np.save(fn.as_posix(), cv2.imread(f), allow_pickle=False)
-            im = np.load(fn)
-        else:  # read image
-            im = cv2.imread(f)  # BGR
-        # Convert NumPy array to PIL image
-        im = Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB))
-        sample = self.torch_transforms(im)
-        return {"img": sample, "cls": j}
+        label_data = self._load_label(label_file)
+        if label_data is None:
+            return im_file, None, "empty"
 
-    def __len__(self) -> int:
-        """Return the total number of samples in the dataset."""
-        return len(self.samples)
+        return im_file, label_data, "found"
 
-    def verify_images(self):
-        """Verify all images in dataset."""
-        desc = f"{self.prefix}Scanning {self.root}..."
-        path = Path(self.root).with_suffix(".cache")  # *.cache file path
+    def _get_label_path(self, im_file):
+        """
+        Generates the corresponding label file path for a given image file.
 
-        with contextlib.suppress(FileNotFoundError, AssertionError, AttributeError):
-            cache = load_dataset_cache_file(path)  # attempt to load a *.cache file
-            assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
-            assert cache["hash"] == get_hash([x[0] for x in self.samples])  # identical hash
-            nf, nc, n, samples = cache.pop("results")  # found, missing, empty, corrupt, total
-            if LOCAL_RANK in (-1, 0):
-                d = f"{desc} {nf} images, {nc} corrupt"
-                TQDM(None, desc=d, total=n, initial=n)
-                if cache["msgs"]:
-                    LOGGER.info("\n".join(cache["msgs"]))  # display warnings
-            return samples
+        Args:
+            im_file (str): Path to the image file.
 
-        # Run scan if *.cache retrieval failed
-        nf, nc, msgs, samples, x = 0, 0, [], [], {}
-        with ThreadPool(NUM_THREADS) as pool:
-            results = pool.imap(func=verify_image, iterable=zip(self.samples, repeat(self.prefix)))
-            pbar = TQDM(results, desc=desc, total=len(self.samples))
-            for sample, nf_f, nc_f, msg in pbar:
-                if nf_f:
-                    samples.append(sample)
-                if msg:
-                    msgs.append(msg)
-                nf += nf_f
-                nc += nc_f
-                pbar.desc = f"{desc} {nf} images, {nc} corrupt"
-            pbar.close()
-        if msgs:
-            LOGGER.info("\n".join(msgs))
-        x["hash"] = get_hash([x[0] for x in self.samples])
-        x["results"] = nf, nc, len(samples), samples
-        x["msgs"] = msgs  # warnings
-        save_dataset_cache_file(self.prefix, path, x)
-        return samples
+        Returns:
+            str: Path to the label file.
+        """
+        label_dir = self.data_config["label_dir"]
+        label_file = os.path.join(label_dir, os.path.splitext(os.path.basename(im_file))[0] + ".txt")
+        return label_file
+
+    def _load_label(self, label_file):
+        """
+        Loads and processes label data from a file.
+
+        Args:
+            label_file (str): Path to the label file.
+
+        Returns:
+            dict: Processed label data.
+        """
+        try:
+            with open(label_file, 'r') as file:
+                labels = np.loadtxt(file, delimiter=' ')
+            return {
+                "cls": labels[:, 0:1],
+                "bboxes": labels[:, 1:],
+                "bbox_format": "xywh",
+                "normalized": True
+            }
+        except Exception as e:
+            print(f"Failed to load label: {e}")
+            return None
+
+    def _generate_hash(self, files):
+        """
+        Generates a unique hash based on the list of files.
+
+        Args:
+            files (list): List of file paths.
+
+        Returns:
+            str: Unique hash value.
+        """
+        return str(hash(tuple(sorted(files))))
+
+    def _save_cache(self, cache_path, cache_data):
+        """
+        Saves cache data to a specified path.
+
+        Args:
+            cache_path (str): Path where the cache data should be saved.
+            cache_data (dict): Data to be cached.
+        """
+        if os.access(os.path.dirname(cache_path), os.W_OK):
+            np.save(cache_path, cache_data)
+        else:
+            print(f"Cache directory {os.path.dirname(cache_path)} is not writable. Cache not saved.")
+
+    def get_data(self):
+        """
+        Retrieves and returns dataset labels from cache or by loading them.
+
+        Returns:
+            list: List of labels for the dataset.
+        """
+        cache_path = os.path.join(self.data_config["label_dir"], "data_cache.cache")
+        if os.path.exists(cache_path):
+            cache = np.load(cache_path, allow_pickle=True).item()
+            if cache["hash"] == self._generate_hash(self.data_config["image_files"]):
+                return cache["labels"]
+            else:
+                return self.cache_data(cache_path)["labels"]
+        else:
+            return self.cache_data(cache_path)["labels"]
+
+    def __len__(self):
+        """Returns the total number of samples in the dataset."""
+        return len(self.data_config["image_files"])
+
+    def __getitem__(self, index):
+        """Returns a single sample from the dataset at the specified index."""
+        image_path = self.data_config["image_files"][index]
+        label_data = self.get_data()[index]
+
+        # Load image and apply transformations
+        image = Image.open(image_path).convert("RGB")
+        transform = self._get_transform()
+        image = transform(image)
+
+        # Return image and corresponding label
+        return {"img": image, "cls": label_data["cls"], "bboxes": label_data["bboxes"]}
+
+    def _get_transform(self):
+        """
+        Returns a transformation pipeline for preprocessing images.
+
+        Returns:
+            Callable: A function that applies transformations to an image.
+        """
+        if self.task_type == "detection":
+            return T.Compose([
+                T.Resize((self.data_config["img_size"], self.data_config["img_size"])),
+                T.ToTensor(),
+            ])
+        else:
+            return T.Compose([T.ToTensor()])
 
 
-def load_dataset_cache_file(path):
-    """Load an Ultralytics *.cache dictionary from path."""
-    import gc
-
-    gc.disable()  # reduce pickle load time https://github.com/ultralytics/ultralytics/pull/1585
-    cache = np.load(str(path), allow_pickle=True).item()  # load dict
-    gc.enable()
-    return cache
-
-
-def save_dataset_cache_file(prefix, path, x):
-    """Save an Ultralytics dataset *.cache dictionary x to path."""
-    x["version"] = DATASET_CACHE_VERSION  # add cache version
-    if is_dir_writeable(path.parent):
-        if path.exists():
-            path.unlink()  # remove *.cache file if exists
-        np.save(str(path), x)  # save cache for next time
-        path.with_suffix(".cache.npy").rename(path)  # remove .npy suffix
-        LOGGER.info(f"{prefix}New cache created: {path}")
-    else:
-        LOGGER.warning(f"{prefix}WARNING ⚠️ Cache directory {path.parent} is not writeable, cache not saved.")
-
-
-# TODO: support semantic segmentation
-class SemanticDataset(BaseDataset):
+class ClassificationDataset(Dataset):
     """
-    Semantic Segmentation Dataset.
-
-    This class is responsible for handling datasets used for semantic segmentation tasks. It inherits functionalities
-    from the BaseDataset class.
-
-    Note:
-        This class is currently a placeholder and needs to be populated with methods and attributes for supporting
-        semantic segmentation tasks.
+    Custom dataset for image classification tasks.
     """
 
-    def __init__(self):
-        """Initialize a SemanticDataset object."""
+    def __init__(self, root_dir, image_size=224, augment=False):
+        """
+        Initializes the ClassificationDataset with root directory and optional transformations.
+
+        Args:
+            root_dir (str): Directory containing image files.
+            image_size (int): Target image size for resizing.
+            augment (bool): Whether to apply data augmentation.
+        """
         super().__init__()
+        self.root_dir = root_dir
+        self.image_paths = list(Path(root_dir).glob('**/*.jpg'))
+        self.image_size = image_size
+        self.augment = augment
+        self.transform = self._build_transform()
+
+    def _build_transform(self):
+        """
+        Builds a transformation pipeline for image preprocessing.
+
+        Returns:
+            Callable: Transformation function.
+        """
+        transform_list = [T.Resize((self.image_size, self.image_size)), T.ToTensor()]
+        if self.augment:
+            transform_list.insert(1, T.RandomHorizontalFlip())
+        return T.Compose(transform_list)
+
+    def __len__(self):
+        """Returns the total number of images in the dataset."""
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        """Retrieves and returns an image and its corresponding label."""
+        image_path = self.image_paths[idx]
+        image = Image.open(image_path).convert("RGB")
+        image = self.transform(image)
+
+        # Assuming directory structure as root/class_name/image.jpg for labels
+        label = image_path.parent.name
+        return {"img": image, "cls": label}
+
+"""
+### YOLODataset Class
+
+Initialize YOLODataset
+   - Accept dataset configuration and task type (detection, segmentation, keypoints).
+   - Set flags for keypoints and segmentation based on task type.
+
+cache_data(cache_path)
+   - Initialize an empty cache dictionary.
+   - Iterate over image files in the dataset.
+     - For each image:
+       - Verify if both image and label files exist.
+       - If valid, add label data to the cache dictionary.
+   - Generate a hash for the dataset and store it in the cache.
+   - Save the cache data to a file at `cache_path`.
+   - Return the cache data.
+
+_verify_image_and_label(im_file)
+   - Generate the corresponding label file path for the given image file.
+   - Check if the image and label files exist.
+   - If both files are valid, load and return the label data.
+   - If not, return an appropriate status indicating missing, empty, or corrupt files.
+
+_get_label_path(im_file)
+   - Construct the path to the label file based on the image file name.
+
+_load_label(label_file)
+   - Open and read the label file.
+   - Process and return the label data (classes, bounding boxes, etc.).
+   - If there is an error, return `None`.
+
+_generate_hash(files)
+   - Create and return a unique hash value based on the list of files.
+
+_save_cache(cache_path, cache_data)
+   - Check if the directory where the cache is to be saved is writable.
+   - If writable, save the cache data to the specified path.
+   - If not writable, output a warning message.
+
+get_data()
+   - Attempt to load cache data from the specified cache path.
+   - If cache exists and is valid, return the labels from the cache.
+   - If the cache is missing or invalid, regenerate the cache and return the labels.
+
+__len__()
+   - Return the number of images in the dataset.
+
+__getitem__(index)
+    - Retrieve the image and label data for the given index.
+    - Apply the necessary transformations to the image.
+    - Return the transformed image and corresponding label data.
+
+_get_transform()
+    - Build and return the transformation pipeline based on task type (detection, classification).
+    - Apply resizing, normalization, and other augmentations if necessary.
+
+### ClassificationDataset Class
+
+Initialize ClassificationDataset
+   - Set the root directory, image size, and whether to apply augmentations.
+   - Create a list of all image file paths in the root directory.
+   - Build the transformation pipeline.
+
+_build_transform()
+   - Create a list of transformations (resizing, normalization).
+   - If augmentations are enabled, add random horizontal flip to the list.
+   - Return the transformation pipeline.
+
+__len__()
+   - Return the total number of images in the dataset.
+
+__getitem__(index)
+   - Retrieve the image file path at the specified index.
+   - Open the image and apply the transformations.
+   - Determine the class label from the directory structure (assume folder names are class names).
+   - Return the transformed image and its class label.
+
+"""
