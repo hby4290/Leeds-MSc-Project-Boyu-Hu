@@ -1,67 +1,68 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-
 import torch
 
-
-def adjust_bboxes_to_image_border(boxes, image_shape, threshold=20):
+def refine_bounding_boxes_to_edges(boxes, image_size, edge_threshold=20):
     """
-    Adjust bounding boxes to stick to image border if they are within a certain threshold.
+    Refine bounding boxes to align with the image edges if they are close to the borders.
 
     Args:
-        boxes (torch.Tensor): (n, 4)
-        image_shape (tuple): (height, width)
-        threshold (int): pixel threshold
+        boxes (torch.Tensor): Tensor of bounding boxes with shape (n, 4), where n is the number of boxes.
+        image_size (tuple): Dimensions of the image as (height, width).
+        edge_threshold (int): Distance in pixels to consider a box edge close to the image border.
 
     Returns:
-        adjusted_boxes (torch.Tensor): adjusted bounding boxes
+        torch.Tensor: The refined bounding boxes tensor.
     """
 
-    # Image dimensions
-    h, w = image_shape
+    # Unpack image dimensions
+    height, width = image_size
 
-    # Adjust boxes
-    boxes[boxes[:, 0] < threshold, 0] = 0  # x1
-    boxes[boxes[:, 1] < threshold, 1] = 0  # y1
-    boxes[boxes[:, 2] > w - threshold, 2] = w  # x2
-    boxes[boxes[:, 3] > h - threshold, 3] = h  # y2
+    # Adjust box coordinates near the image borders
+    boxes[:, 0] = torch.where(boxes[:, 0] < edge_threshold, torch.zeros_like(boxes[:, 0]), boxes[:, 0])  # x1
+    boxes[:, 1] = torch.where(boxes[:, 1] < edge_threshold, torch.zeros_like(boxes[:, 1]), boxes[:, 1])  # y1
+    boxes[:, 2] = torch.where(boxes[:, 2] > width - edge_threshold, torch.full_like(boxes[:, 2], width), boxes[:, 2])  # x2
+    boxes[:, 3] = torch.where(boxes[:, 3] > height - edge_threshold, torch.full_like(boxes[:, 3], height), boxes[:, 3])  # y2
+
     return boxes
 
-
-def bbox_iou(box1, boxes, iou_thres=0.9, image_shape=(640, 640), raw_output=False):
+def calculate_iou(reference_box, comparison_boxes, iou_threshold=0.9, image_size=(640, 640), return_raw=False):
     """
-    Compute the Intersection-Over-Union of a bounding box with respect to an array of other bounding boxes.
+    Calculate the Intersection Over Union (IoU) between a reference bounding box and multiple comparison boxes.
 
     Args:
-        box1 (torch.Tensor): (4, )
-        boxes (torch.Tensor): (n, 4)
-        iou_thres (float): IoU threshold
-        image_shape (tuple): (height, width)
-        raw_output (bool): If True, return the raw IoU values instead of the indices
+        reference_box (torch.Tensor): Tensor of a single bounding box with shape (4,).
+        comparison_boxes (torch.Tensor): Tensor of multiple bounding boxes with shape (n, 4).
+        iou_threshold (float): The threshold above which IoU is considered significant.
+        image_size (tuple): Size of the image as (height, width).
+        return_raw (bool): If True, returns the raw IoU values instead of indices.
 
     Returns:
-        high_iou_indices (torch.Tensor): Indices of boxes with IoU > thres
+        torch.Tensor: Indices of boxes with IoU greater than the threshold, or raw IoU values if return_raw is True.
     """
-    boxes = adjust_bboxes_to_image_border(boxes, image_shape)
-    # Obtain coordinates for intersections
-    x1 = torch.max(box1[0], boxes[:, 0])
-    y1 = torch.max(box1[1], boxes[:, 1])
-    x2 = torch.min(box1[2], boxes[:, 2])
-    y2 = torch.min(box1[3], boxes[:, 3])
+    # Refine the bounding boxes to align with image borders
+    comparison_boxes = refine_bounding_boxes_to_edges(comparison_boxes, image_size)
 
-    # Compute the area of intersection
-    intersection = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+    # Calculate the intersection coordinates
+    inter_x1 = torch.max(reference_box[0], comparison_boxes[:, 0])
+    inter_y1 = torch.max(reference_box[1], comparison_boxes[:, 1])
+    inter_x2 = torch.min(reference_box[2], comparison_boxes[:, 2])
+    inter_y2 = torch.min(reference_box[3], comparison_boxes[:, 3])
 
-    # Compute the area of both individual boxes
-    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    box2_area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    # Calculate intersection area, ensuring non-negative dimensions
+    intersection_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
 
-    # Compute the area of union
-    union = box1_area + box2_area - intersection
+    # Calculate areas of the reference and comparison boxes
+    ref_box_area = (reference_box[2] - reference_box[0]) * (reference_box[3] - reference_box[1])
+    comp_boxes_area = (comparison_boxes[:, 2] - comparison_boxes[:, 0]) * (comparison_boxes[:, 3] - comparison_boxes[:, 1])
 
-    # Compute the IoU
-    iou = intersection / union  # Should be shape (n, )
-    if raw_output:
-        return 0 if iou.numel() == 0 else iou
+    # Calculate union area
+    union_area = ref_box_area + comp_boxes_area - intersection_area
 
-    # return indices of boxes with IoU > thres
-    return torch.nonzero(iou > iou_thres).flatten()
+    # Compute IoU
+    iou_values = intersection_area / union_area
+
+    if return_raw:
+        # Return raw IoU values
+        return iou_values if iou_values.numel() > 0 else torch.tensor(0.0)
+
+    # Return indices of boxes that meet the IoU threshold
+    return torch.nonzero(iou_values > iou_threshold).flatten()
