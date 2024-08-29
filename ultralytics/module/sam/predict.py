@@ -1,13 +1,3 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-"""
-Generate predictions using the Segment Anything Model (SAM).
-
-SAM is an advanced image segmentation model offering features like promptable segmentation and zero-shot performance.
-This module contains the implementation of the prediction logic and auxiliary utilities required to perform segmentation
-using SAM. It forms an integral part of the Ultralytics framework and is designed for high-performance, real-time image
-segmentation tasks.
-"""
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -31,38 +21,32 @@ from .amg import (
 )
 from .build import build_sam
 
-
-class Predictor(BasePredictor):
+class SAMPredictor(BasePredictor):
     """
-    Predictor class for the Segment Anything Model (SAM), extending BasePredictor.
+    SAMPredictor class for the Segment Anything Model (SAM), extending BasePredictor.
 
-    The class provides an interface for model inference tailored to image segmentation tasks.
-    With advanced architecture and promptable segmentation capabilities, it facilitates flexible and real-time
-    mask generation. The class is capable of working with various types of prompts such as bounding boxes,
-    points, and low-resolution masks.
+    This class provides an interface for performing image segmentation using SAM, capable of handling various prompts
+    including bounding boxes, points, and masks. It supports both real-time and prompt-based segmentation tasks.
 
     Attributes:
-        cfg (dict): Configuration dictionary specifying model and task-related parameters.
-        overrides (dict): Dictionary containing values that override the default configuration.
-        _callbacks (dict): Dictionary of user-defined callback functions to augment behavior.
-        args (namespace): Namespace to hold command-line arguments or other operational variables.
+        cfg (dict): Configuration settings for the model and task.
+        overrides (dict): Configuration overrides.
+        _callbacks (dict): Callbacks for custom behavior.
+        args (namespace): Command-line arguments or operational variables.
         im (torch.Tensor): Preprocessed input image tensor.
-        features (torch.Tensor): Extracted image features used for inference.
-        prompts (dict): Collection of various prompt types, such as bounding boxes and points.
-        segment_all (bool): Flag to control whether to segment all objects in the image or only specified ones.
+        features (torch.Tensor): Image features used for inference.
+        prompts (dict): Prompt settings for the model.
+        segment_all (bool): Flag to determine if all objects in the image should be segmented.
     """
 
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         """
-        Initialize the Predictor with configuration, overrides, and callbacks.
-
-        The method sets up the Predictor object and applies any configuration overrides or callbacks provided. It
-        initializes task-specific settings for SAM, such as retina_masks being set to True for optimal results.
+        Initialize the SAMPredictor with configurations, overrides, and callbacks.
 
         Args:
             cfg (dict): Configuration dictionary.
-            overrides (dict, optional): Dictionary of values to override default configuration.
-            _callbacks (dict, optional): Dictionary of callback functions to customize behavior.
+            overrides (dict, optional): Dictionary for configuration overrides.
+            _callbacks (dict, optional): Callback functions for customization.
         """
         if overrides is None:
             overrides = {}
@@ -74,127 +58,109 @@ class Predictor(BasePredictor):
         self.prompts = {}
         self.segment_all = False
 
-    def preprocess(self, im):
+    def preprocess_image(self, im):
         """
-        Preprocess the input image for model inference.
-
-        The method prepares the input image by applying transformations and normalization.
-        It supports both torch.Tensor and list of np.ndarray as input formats.
+        Preprocess the input image to prepare it for model inference.
 
         Args:
-            im (torch.Tensor | List[np.ndarray]): BCHW tensor format or list of HWC numpy arrays.
+            im (torch.Tensor | List[np.ndarray]): Image in tensor or numpy format.
 
         Returns:
-            (torch.Tensor): The preprocessed image tensor.
+            torch.Tensor: The preprocessed image tensor.
         """
         if self.im is not None:
             return self.im
-        not_tensor = not isinstance(im, torch.Tensor)
-        if not_tensor:
-            im = np.stack(self.pre_transform(im))
+        
+        if not isinstance(im, torch.Tensor):
+            im = np.stack(self.transform_images(im))
             im = im[..., ::-1].transpose((0, 3, 1, 2))
             im = np.ascontiguousarray(im)
             im = torch.from_numpy(im)
 
         im = im.to(self.device)
         im = im.half() if self.model.fp16 else im.float()
-        if not_tensor:
+        if not isinstance(im, torch.Tensor):
             im = (im - self.mean) / self.std
         return im
 
-    def pre_transform(self, im):
+    def transform_images(self, im):
         """
-        Perform initial transformations on the input image for preprocessing.
-
-        The method applies transformations such as resizing to prepare the image for further preprocessing.
-        Currently, batched inference is not supported; hence the list length should be 1.
+        Apply initial transformations to images for preprocessing.
 
         Args:
-            im (List[np.ndarray]): List containing images in HWC numpy array format.
+            im (List[np.ndarray]): List of images in HWC format.
 
         Returns:
-            (List[np.ndarray]): List of transformed images.
+            List[np.ndarray]: Transformed images.
         """
-        assert len(im) == 1, "SAM model does not currently support batched inference"
+        assert len(im) == 1, "Batch processing is not supported"
         letterbox = LetterBox(self.args.imgsz, auto=False, center=False)
         return [letterbox(image=x) for x in im]
 
-    def inference(self, im, bboxes=None, points=None, labels=None, masks=None, multimask_output=False, *args, **kwargs):
+    def perform_inference(self, im, bboxes=None, points=None, labels=None, masks=None, multimask_output=False, *args, **kwargs):
         """
-        Perform image segmentation inference based on the given input cues, using the currently loaded image. This
-        method leverages SAM's (Segment Anything Model) architecture consisting of image encoder, prompt encoder, and
-        mask decoder for real-time and promptable segmentation tasks.
+        Run segmentation inference based on given prompts or generate new masks.
 
         Args:
-            im (torch.Tensor): The preprocessed input image in tensor format, with shape (N, C, H, W).
-            bboxes (np.ndarray | List, optional): Bounding boxes with shape (N, 4), in XYXY format.
-            points (np.ndarray | List, optional): Points indicating object locations with shape (N, 2), in pixel coordinates.
-            labels (np.ndarray | List, optional): Labels for point prompts, shape (N, ). 1 for foreground and 0 for background.
-            masks (np.ndarray, optional): Low-resolution masks from previous predictions. Shape should be (N, H, W). For SAM, H=W=256.
-            multimask_output (bool, optional): Flag to return multiple masks. Helpful for ambiguous prompts. Defaults to False.
+            im (torch.Tensor): Preprocessed image tensor.
+            bboxes (np.ndarray | List, optional): Bounding boxes for object location.
+            points (np.ndarray | List, optional): Points indicating object location.
+            labels (np.ndarray | List, optional): Labels for points.
+            masks (np.ndarray, optional): Low-resolution masks from previous results.
+            multimask_output (bool, optional): Whether to return multiple masks.
 
         Returns:
-            (tuple): Contains the following three elements.
-                - np.ndarray: The output masks in shape CxHxW, where C is the number of generated masks.
-                - np.ndarray: An array of length C containing quality scores predicted by the model for each mask.
-                - np.ndarray: Low-resolution logits of shape CxHxW for subsequent inference, where H=W=256.
+            tuple: Contains masks, scores, and low-resolution logits.
         """
-        # Override prompts if any stored in self.prompts
         bboxes = self.prompts.pop("bboxes", bboxes)
         points = self.prompts.pop("points", points)
         masks = self.prompts.pop("masks", masks)
 
         if all(i is None for i in [bboxes, points, masks]):
-            return self.generate(im, *args, **kwargs)
+            return self.create_masks(im, *args, **kwargs)
 
-        return self.prompt_inference(im, bboxes, points, labels, masks, multimask_output)
+        return self.perform_prompt_inference(im, bboxes, points, labels, masks, multimask_output)
 
-    def prompt_inference(self, im, bboxes=None, points=None, labels=None, masks=None, multimask_output=False):
+    def perform_prompt_inference(self, im, bboxes=None, points=None, labels=None, masks=None, multimask_output=False):
         """
-        Internal function for image segmentation inference based on cues like bounding boxes, points, and masks.
-        Leverages SAM's specialized architecture for prompt-based, real-time segmentation.
+        Conduct inference using specific prompts (e.g., bounding boxes, points).
 
         Args:
-            im (torch.Tensor): The preprocessed input image in tensor format, with shape (N, C, H, W).
-            bboxes (np.ndarray | List, optional): Bounding boxes with shape (N, 4), in XYXY format.
-            points (np.ndarray | List, optional): Points indicating object locations with shape (N, 2), in pixel coordinates.
-            labels (np.ndarray | List, optional): Labels for point prompts, shape (N, ). 1 for foreground and 0 for background.
-            masks (np.ndarray, optional): Low-resolution masks from previous predictions. Shape should be (N, H, W). For SAM, H=W=256.
-            multimask_output (bool, optional): Flag to return multiple masks. Helpful for ambiguous prompts. Defaults to False.
+            im (torch.Tensor): Preprocessed image tensor.
+            bboxes (np.ndarray | List, optional): Bounding boxes.
+            points (np.ndarray | List, optional): Points for object location.
+            labels (np.ndarray | List, optional): Labels for points.
+            masks (np.ndarray, optional): Low-resolution masks.
+            multimask_output (bool, optional): Flag for multiple mask outputs.
 
         Returns:
-            (tuple): Contains the following three elements.
-                - np.ndarray: The output masks in shape CxHxW, where C is the number of generated masks.
-                - np.ndarray: An array of length C containing quality scores predicted by the model for each mask.
-                - np.ndarray: Low-resolution logits of shape CxHxW for subsequent inference, where H=W=256.
+            tuple: Masks, scores, and logits.
         """
         features = self.model.image_encoder(im) if self.features is None else self.features
 
         src_shape, dst_shape = self.batch[1][0].shape[:2], im.shape[2:]
-        r = 1.0 if self.segment_all else min(dst_shape[0] / src_shape[0], dst_shape[1] / src_shape[1])
-        # Transform input prompts
+        scale_factor = 1.0 if self.segment_all else min(dst_shape[0] / src_shape[0], dst_shape[1] / src_shape[1])
+        
         if points is not None:
             points = torch.as_tensor(points, dtype=torch.float32, device=self.device)
             points = points[None] if points.ndim == 1 else points
-            # Assuming labels are all positive if users don't pass labels.
             if labels is None:
                 labels = np.ones(points.shape[0])
             labels = torch.as_tensor(labels, dtype=torch.int32, device=self.device)
-            points *= r
-            # (N, 2) --> (N, 1, 2), (N, ) --> (N, 1)
+            points *= scale_factor
             points, labels = points[:, None, :], labels[:, None]
+        
         if bboxes is not None:
             bboxes = torch.as_tensor(bboxes, dtype=torch.float32, device=self.device)
             bboxes = bboxes[None] if bboxes.ndim == 1 else bboxes
-            bboxes *= r
+            bboxes *= scale_factor
+        
         if masks is not None:
             masks = torch.as_tensor(masks, dtype=torch.float32, device=self.device).unsqueeze(1)
 
         points = (points, labels) if points is not None else None
-        # Embed prompts
         sparse_embeddings, dense_embeddings = self.model.prompt_encoder(points=points, boxes=bboxes, masks=masks)
 
-        # Predict masks
         pred_masks, pred_scores = self.model.mask_decoder(
             image_embeddings=features,
             image_pe=self.model.prompt_encoder.get_dense_pe(),
@@ -203,272 +169,203 @@ class Predictor(BasePredictor):
             multimask_output=multimask_output,
         )
 
-        # (N, d, H, W) --> (N*d, H, W), (N, d) --> (N*d, )
-        # `d` could be 1 or 3 depends on `multimask_output`.
         return pred_masks.flatten(0, 1), pred_scores.flatten(0, 1)
 
-    def generate(
+    def create_masks(
         self,
         im,
-        crop_n_layers=0,
-        crop_overlap_ratio=512 / 1500,
-        crop_downscale_factor=1,
+        crop_layers=0,
+        crop_overlap=512 / 1500,
+        downscale_factor=1,
         point_grids=None,
-        points_stride=32,
-        points_batch_size=64,
-        conf_thres=0.88,
-        stability_score_thresh=0.95,
-        stability_score_offset=0.95,
-        crop_nms_thresh=0.7,
+        stride=32,
+        batch_size=64,
+        confidence_threshold=0.88,
+        stability_threshold=0.95,
+        stability_offset=0.95,
+        nms_threshold=0.7,
     ):
         """
-        Perform image segmentation using the Segment Anything Model (SAM).
-
-        This function segments an entire image into constituent parts by leveraging SAM's advanced architecture
-        and real-time performance capabilities. It can optionally work on image crops for finer segmentation.
+        Segment the image into parts using the SAM model, optionally processing crops.
 
         Args:
-            im (torch.Tensor): Input tensor representing the preprocessed image with dimensions (N, C, H, W).
-            crop_n_layers (int): Specifies the number of layers for additional mask predictions on image crops.
-                                 Each layer produces 2**i_layer number of image crops.
-            crop_overlap_ratio (float): Determines the extent of overlap between crops. Scaled down in subsequent layers.
-            crop_downscale_factor (int): Scaling factor for the number of sampled points-per-side in each layer.
-            point_grids (list[np.ndarray], optional): Custom grids for point sampling normalized to [0,1].
-                                                      Used in the nth crop layer.
-            points_stride (int, optional): Number of points to sample along each side of the image.
-                                           Exclusive with 'point_grids'.
-            points_batch_size (int): Batch size for the number of points processed simultaneously.
-            conf_thres (float): Confidence threshold [0,1] for filtering based on the model's mask quality prediction.
-            stability_score_thresh (float): Stability threshold [0,1] for mask filtering based on mask stability.
-            stability_score_offset (float): Offset value for calculating stability score.
-            crop_nms_thresh (float): IoU cutoff for Non-Maximum Suppression (NMS) to remove duplicate masks between crops.
+            im (torch.Tensor): Input image tensor.
+            crop_layers (int): Number of crop layers.
+            crop_overlap (float): Overlap ratio between crops.
+            downscale_factor (int): Downscale factor for sampling points.
+            point_grids (list[np.ndarray], optional): Custom grids for point sampling.
+            stride (int, optional): Sampling stride for points.
+            batch_size (int): Batch size for processing points.
+            confidence_threshold (float): Threshold for mask confidence.
+            stability_threshold (float): Threshold for mask stability.
+            stability_offset (float): Offset for stability score calculation.
+            nms_threshold (float): IoU threshold for Non-Maximum Suppression.
 
         Returns:
-            (tuple): A tuple containing segmented masks, confidence scores, and bounding boxes.
+            tuple: Masks, scores, and bounding boxes.
         """
         self.segment_all = True
         ih, iw = im.shape[2:]
-        crop_regions, layer_idxs = generate_crop_boxes((ih, iw), crop_n_layers, crop_overlap_ratio)
+        crop_boxes, layer_indices = generate_crop_boxes((ih, iw), crop_layers, crop_overlap)
         if point_grids is None:
-            point_grids = build_all_layer_point_grids(points_stride, crop_n_layers, crop_downscale_factor)
-        pred_masks, pred_scores, pred_bboxes, region_areas = [], [], [], []
-        for crop_region, layer_idx in zip(crop_regions, layer_idxs):
-            x1, y1, x2, y2 = crop_region
+            point_grids = build_all_layer_point_grids(stride, crop_layers, downscale_factor)
+        
+        all_masks, all_scores, all_bboxes, areas = [], [], [], []
+        for box, layer_idx in zip(crop_boxes, layer_indices):
+            x1, y1, x2, y2 = box
             w, h = x2 - x1, y2 - y1
             area = torch.tensor(w * h, device=im.device)
-            points_scale = np.array([[w, h]])  # w, h
-            # Crop image and interpolate to input size
-            crop_im = F.interpolate(im[..., y1:y2, x1:x2], (ih, iw), mode="bilinear", align_corners=False)
-            # (num_points, 2)
-            points_for_image = point_grids[layer_idx] * points_scale
-            crop_masks, crop_scores, crop_bboxes = [], [], []
-            for (points,) in batch_iterator(points_batch_size, points_for_image):
-                pred_mask, pred_score = self.prompt_inference(crop_im, points=points, multimask_output=True)
-                # Interpolate predicted masks to input size
-                pred_mask = F.interpolate(pred_mask[None], (h, w), mode="bilinear", align_corners=False)[0]
-                idx = pred_score > conf_thres
-                pred_mask, pred_score = pred_mask[idx], pred_score[idx]
+            points_scale = np.array([[w, h]])
+            cropped_im = F.interpolate(im[..., y1:y2, x1:x2], size=(self.args.imgsz, self.args.imgsz), mode='bilinear', align_corners=False)
+            masks, scores = self.perform_prompt_inference(cropped_im, *args, **kwargs)
+            masks, scores = self.process_crops(masks, scores, box, points_scale, area, confidence_threshold, stability_threshold, stability_offset, nms_threshold)
+            all_masks.append(masks)
+            all_scores.append(scores)
+            all_bboxes.append(box)
+            areas.append(area)
+        
+        # Combine and filter masks
+        all_masks = torch.cat(all_masks, dim=0)
+        all_scores = torch.cat(all_scores, dim=0)
+        all_bboxes = torch.tensor(all_bboxes, dtype=torch.float32, device=im.device)
+        areas = torch.cat(areas, dim=0)
+        all_bboxes = uncrop_boxes_xyxy(all_bboxes, (ih, iw))
+        all_masks = uncrop_masks(all_masks, all_bboxes, (ih, iw), crop_layers)
 
-                stability_score = calculate_stability_score(
-                    pred_mask, self.model.mask_threshold, stability_score_offset
-                )
-                idx = stability_score > stability_score_thresh
-                pred_mask, pred_score = pred_mask[idx], pred_score[idx]
-                # Bool type is much more memory-efficient.
-                pred_mask = pred_mask > self.model.mask_threshold
-                # (N, 4)
-                pred_bbox = batched_mask_to_box(pred_mask).float()
-                keep_mask = ~is_box_near_crop_edge(pred_bbox, crop_region, [0, 0, iw, ih])
-                if not torch.all(keep_mask):
-                    pred_bbox, pred_mask, pred_score = pred_bbox[keep_mask], pred_mask[keep_mask], pred_score[keep_mask]
+        # Non-Maximum Suppression
+        keep = ops.non_max_suppression(all_bboxes, all_scores, iou_thres=nms_threshold)
+        return all_masks[keep], all_scores[keep], all_bboxes[keep]
 
-                crop_masks.append(pred_mask)
-                crop_bboxes.append(pred_bbox)
-                crop_scores.append(pred_score)
-
-            # Do nms within this crop
-            crop_masks = torch.cat(crop_masks)
-            crop_bboxes = torch.cat(crop_bboxes)
-            crop_scores = torch.cat(crop_scores)
-            keep = torchvision.ops.nms(crop_bboxes, crop_scores, self.args.iou)  # NMS
-            crop_bboxes = uncrop_boxes_xyxy(crop_bboxes[keep], crop_region)
-            crop_masks = uncrop_masks(crop_masks[keep], crop_region, ih, iw)
-            crop_scores = crop_scores[keep]
-
-            pred_masks.append(crop_masks)
-            pred_bboxes.append(crop_bboxes)
-            pred_scores.append(crop_scores)
-            region_areas.append(area.expand(len(crop_masks)))
-
-        pred_masks = torch.cat(pred_masks)
-        pred_bboxes = torch.cat(pred_bboxes)
-        pred_scores = torch.cat(pred_scores)
-        region_areas = torch.cat(region_areas)
-
-        # Remove duplicate masks between crops
-        if len(crop_regions) > 1:
-            scores = 1 / region_areas
-            keep = torchvision.ops.nms(pred_bboxes, scores, crop_nms_thresh)
-            pred_masks, pred_bboxes, pred_scores = pred_masks[keep], pred_bboxes[keep], pred_scores[keep]
-
-        return pred_masks, pred_scores, pred_bboxes
-
-    def setup_model(self, model, verbose=True):
+    def process_crops(self, masks, scores, box, points_scale, area, confidence_threshold, stability_threshold, stability_offset, nms_threshold):
         """
-        Initializes the Segment Anything Model (SAM) for inference.
-
-        This method sets up the SAM model by allocating it to the appropriate device and initializing the necessary
-        parameters for image normalization and other Ultralytics compatibility settings.
+        Process and filter masks from cropped images.
 
         Args:
-            model (torch.nn.Module): A pre-trained SAM model. If None, a model will be built based on configuration.
-            verbose (bool): If True, prints selected device information.
-
-        Attributes:
-            model (torch.nn.Module): The SAM model allocated to the chosen device for inference.
-            device (torch.device): The device to which the model and tensors are allocated.
-            mean (torch.Tensor): The mean values for image normalization.
-            std (torch.Tensor): The standard deviation values for image normalization.
-        """
-        device = select_device(self.args.device, verbose=verbose)
-        if model is None:
-            model = build_sam(self.args.model)
-        model.eval()
-        self.model = model.to(device)
-        self.device = device
-        self.mean = torch.tensor([123.675, 116.28, 103.53]).view(-1, 1, 1).to(device)
-        self.std = torch.tensor([58.395, 57.12, 57.375]).view(-1, 1, 1).to(device)
-
-        # Ultralytics compatibility settings
-        self.model.pt = False
-        self.model.triton = False
-        self.model.stride = 32
-        self.model.fp16 = False
-        self.done_warmup = True
-
-    def postprocess(self, preds, img, orig_imgs):
-        """
-        Post-processes SAM's inference outputs to generate object detection masks and bounding boxes.
-
-        The method scales masks and boxes to the original image size and applies a threshold to the mask predictions. The
-        SAM model uses advanced architecture and promptable segmentation tasks to achieve real-time performance.
-
-        Args:
-            preds (tuple): The output from SAM model inference, containing masks, scores, and optional bounding boxes.
-            img (torch.Tensor): The processed input image tensor.
-            orig_imgs (list | torch.Tensor): The original, unprocessed images.
+            masks (torch.Tensor): Mask predictions from the model.
+            scores (torch.Tensor): Mask scores.
+            box (tuple): Crop bounding box coordinates.
+            points_scale (np.ndarray): Scaling factors for points.
+            area (torch.Tensor): Area of the crop.
+            confidence_threshold (float): Confidence threshold.
+            stability_threshold (float): Stability threshold.
+            stability_offset (float): Offset for stability score calculation.
+            nms_threshold (float): IoU threshold for Non-Maximum Suppression.
 
         Returns:
-            (list): List of Results objects containing detection masks, bounding boxes, and other metadata.
+            tuple: Processed masks and scores.
         """
-        # (N, 1, H, W), (N, 1)
-        pred_masks, pred_scores = preds[:2]
-        pred_bboxes = preds[2] if self.segment_all else None
-        names = dict(enumerate(str(i) for i in range(len(pred_masks))))
+        scores, masks = self.filter_by_confidence(scores, masks, confidence_threshold)
+        scores, masks = self.filter_by_stability(scores, masks, area, stability_threshold, stability_offset)
+        scores, masks = self.apply_nms(scores, masks, box, nms_threshold)
+        return masks, scores
 
-        if not isinstance(orig_imgs, list):  # input images are a torch.Tensor, not a list
-            orig_imgs = ops.convert_torch2numpy_batch(orig_imgs)
-
-        results = []
-        for i, masks in enumerate([pred_masks]):
-            orig_img = orig_imgs[i]
-            if pred_bboxes is not None:
-                pred_bboxes = ops.scale_boxes(img.shape[2:], pred_bboxes.float(), orig_img.shape, padding=False)
-                cls = torch.arange(len(pred_masks), dtype=torch.int32, device=pred_masks.device)
-                pred_bboxes = torch.cat([pred_bboxes, pred_scores[:, None], cls[:, None]], dim=-1)
-
-            masks = ops.scale_masks(masks[None].float(), orig_img.shape[:2], padding=False)[0]
-            masks = masks > self.model.mask_threshold  # to bool
-            img_path = self.batch[0][i]
-            results.append(Results(orig_img, path=img_path, names=names, masks=masks, boxes=pred_bboxes))
-        # Reset segment-all mode.
-        self.segment_all = False
-        return results
-
-    def setup_source(self, source):
+    def filter_by_confidence(self, scores, masks, threshold):
         """
-        Sets up the data source for inference.
-
-        This method configures the data source from which images will be fetched for inference. The source could be a
-        directory, a video file, or other types of image data sources.
+        Filter masks by confidence score.
 
         Args:
-            source (str | Path): The path to the image data source for inference.
-        """
-        if source is not None:
-            super().setup_source(source)
-
-    def set_image(self, image):
-        """
-        Preprocesses and sets a single image for inference.
-
-        This function sets up the model if not already initialized, configures the data source to the specified image,
-        and preprocesses the image for feature extraction. Only one image can be set at a time.
-
-        Args:
-            image (str | np.ndarray): Image file path as a string, or a np.ndarray image read by cv2.
-
-        Raises:
-            AssertionError: If more than one image is set.
-        """
-        if self.model is None:
-            model = build_sam(self.args.model)
-            self.setup_model(model)
-        self.setup_source(image)
-        assert len(self.dataset) == 1, "`set_image` only supports setting one image!"
-        for batch in self.dataset:
-            im = self.preprocess(batch[1])
-            self.features = self.model.image_encoder(im)
-            self.im = im
-            break
-
-    def set_prompts(self, prompts):
-        """Set prompts in advance."""
-        self.prompts = prompts
-
-    def reset_image(self):
-        """Resets the image and its features to None."""
-        self.im = None
-        self.features = None
-
-    @staticmethod
-    def remove_small_regions(masks, min_area=0, nms_thresh=0.7):
-        """
-        Perform post-processing on segmentation masks generated by the Segment Anything Model (SAM). Specifically, this
-        function removes small disconnected regions and holes from the input masks, and then performs Non-Maximum
-        Suppression (NMS) to eliminate any newly created duplicate boxes.
-
-        Args:
-            masks (torch.Tensor): A tensor containing the masks to be processed. Shape should be (N, H, W), where N is
-                                  the number of masks, H is height, and W is width.
-            min_area (int): The minimum area below which disconnected regions and holes will be removed. Defaults to 0.
-            nms_thresh (float): The IoU threshold for the NMS algorithm. Defaults to 0.7.
+            scores (torch.Tensor): Mask scores.
+            masks (torch.Tensor): Mask predictions.
+            threshold (float): Confidence threshold.
 
         Returns:
-            (tuple([torch.Tensor, List[int]])):
-                - new_masks (torch.Tensor): The processed masks with small regions removed. Shape is (N, H, W).
-                - keep (List[int]): The indices of the remaining masks post-NMS, which can be used to filter the boxes.
+            tuple: Filtered scores and masks.
         """
-        if len(masks) == 0:
-            return masks
+        keep = scores >= threshold
+        return scores[keep], masks[keep]
 
-        # Filter small disconnected regions and holes
-        new_masks = []
-        scores = []
-        for mask in masks:
-            mask = mask.cpu().numpy().astype(np.uint8)
-            mask, changed = remove_small_regions(mask, min_area, mode="holes")
-            unchanged = not changed
-            mask, changed = remove_small_regions(mask, min_area, mode="islands")
-            unchanged = unchanged and not changed
+    def filter_by_stability(self, scores, masks, area, threshold, offset):
+        """
+        Filter masks by stability score.
 
-            new_masks.append(torch.as_tensor(mask).unsqueeze(0))
-            # Give score=0 to changed masks and 1 to unchanged masks so NMS prefers masks not needing postprocessing
-            scores.append(float(unchanged))
+        Args:
+            scores (torch.Tensor): Mask scores.
+            masks (torch.Tensor): Mask predictions.
+            area (torch.Tensor): Area of the crop.
+            threshold (float): Stability threshold.
+            offset (float): Offset for stability score calculation.
 
-        # Recalculate boxes and remove any new duplicates
-        new_masks = torch.cat(new_masks, dim=0)
-        boxes = batched_mask_to_box(new_masks)
-        keep = torchvision.ops.nms(boxes.float(), torch.as_tensor(scores), nms_thresh)
+        Returns:
+            tuple: Filtered scores and masks.
+        """
+        stability_scores = calculate_stability_score(masks, area, offset)
+        keep = stability_scores >= threshold
+        return scores[keep], masks[keep]
 
-        return new_masks[keep].to(device=masks.device, dtype=masks.dtype), keep
+    def apply_nms(self, scores, masks, box, threshold):
+        """
+        Apply Non-Maximum Suppression to filter overlapping masks.
+
+        Args:
+            scores (torch.Tensor): Mask scores.
+            masks (torch.Tensor): Mask predictions.
+            box (tuple): Bounding box coordinates.
+            threshold (float): IoU threshold for NMS.
+
+        Returns:
+            tuple: Masks and scores after NMS.
+        """
+        bboxes = batched_mask_to_box(masks, box)
+        keep = ops.non_max_suppression(bboxes, scores, iou_thres=threshold)
+        return masks[keep], scores[keep]
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize the model and predictor
+    device = select_device('cuda' if torch.cuda.is_available() else 'cpu')
+    predictor = SAMPredictor(cfg=DEFAULT_CFG, overrides={'imgsz': 1024})
+    predictor.model.to(device)
+
+    # Load and preprocess the image
+    image_path = 'path/to/image.jpg'
+    image = torchvision.io.read_image(image_path).unsqueeze(0).float() / 255.0
+    image = image.to(device)
+
+    # Run segmentation
+    masks, scores, bboxes = predictor.perform_inference(image)
+
+    # Process results
+    print(f"Detected {len(masks)} masks with scores: {scores}")
+    for mask in masks:
+        # Convert mask to PIL image or other formats for visualization
+        pass
+
+"""
+Class SAMPredictor inherits from BasePredictor
+    Method initialize(cfg, overrides=None, _callbacks=None)
+        Call parent class initialize
+        Set special attributes for the model
+        Initialize image, features, and prompts
+
+    Method preprocess_image(im)
+        If im is already preprocessed
+            Return im
+        If im is not a tensor
+            Convert im to tensor (e.g., Numpy array to tensor)
+        Convert image to appropriate format and device
+        Return preprocessed image
+
+    Method transform_images(im)
+        Apply initial transformations to the input image (e.g., resizing)
+        Return list of transformed images
+
+    Method perform_inference(im, bboxes=None, points=None, labels=None, masks=None, multimask_output=False, *args, **kwargs)
+        If no prompts (e.g., bounding boxes, points, or masks) are provided
+            Create masks
+        Otherwise, perform prompt-based inference
+        Return masks, scores, and low-resolution logits
+
+    Method perform_prompt_inference(im, bboxes=None, points=None, labels=None, masks=None, multimask_output=False)
+        If feature maps are not available
+            Obtain features from the model
+        Perform inference based on prompts (points, bounding boxes, masks)
+        Return masks and scores
+
+    Method create_masks(im, crop_layers=0, crop_overlap=0.34, downscale_factor=1, point_grids=None, stride=32, batch_size=64, confidence_threshold=0.88, stability_threshold=0.95, stability_offset=0.95, nms_threshold=0.7)
+        Generate cropping boxes for the image
+        For each cropping box
+            Crop and infer from the image
+        Process and combine results from each cropped region
+        Return combined masks
+
+"""
