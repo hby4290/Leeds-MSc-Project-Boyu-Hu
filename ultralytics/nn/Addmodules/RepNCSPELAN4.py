@@ -1,3 +1,7 @@
+# This implementation is based on the code from the following repository
+# RepConv is a basic rep-style block。
+# https://github.com/DingXiaoH/RepVGG/blob/main/repvgg.py
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -6,9 +10,6 @@ __all__ = ['RepNCSPELAN4_low', 'RepNCSPELAN4_high']
  
  
 class RepConvN(nn.Module):
-    """RepConv is a basic rep-style block, including training and deploy status
-    This code is based on https://github.com/DingXiaoH/RepVGG/blob/main/repvgg.py
-    """
     default_act = nn.SiLU()  # default activation
  
     def __init__(self, c1, c2, k=3, s=1, p=1, g=1, d=1, act=True, bn=False, deploy=False):
