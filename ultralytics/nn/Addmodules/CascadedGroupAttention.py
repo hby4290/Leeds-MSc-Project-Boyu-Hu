@@ -1,3 +1,4 @@
+# This implementation is based on the original EfficientViT code from the following repository
 # https://github.com/microsoft/Cream/blob/ef68993c764f241a768cd69a087ed567dec6cb40/EfficientViT
 import itertools
 import torch
