@@ -1,541 +1,437 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Rewritten YOLO Loader Classes
 
-import glob
-import math
 import os
+import cv2
 import time
-from dataclasses import dataclass
+import torch
+import numpy as np
 from pathlib import Path
 from threading import Thread
 from urllib.parse import urlparse
-
-import cv2
-import numpy as np
-import requests
-import torch
 from PIL import Image
+from dataclasses import dataclass
+from collections import deque
 
+from ultralytics.utils import LOGGER, check_requirements
 from ultralytics.data.utils import IMG_FORMATS, VID_FORMATS
-from ultralytics.utils import LOGGER, is_colab, is_kaggle, ops
-from ultralytics.utils.checks import check_requirements
 
 
 @dataclass
-class SourceTypes:
-    """Class to represent various types of input sources for predictions."""
-
+class InputSource:
+    """Data class to represent various input source types."""
     webcam: bool = False
     screenshot: bool = False
-    from_img: bool = False
-    tensor: bool = False
+    image_file: bool = False
+    tensor_input: bool = False
 
 
-class LoadStreams:
+class StreamLoader:
     """
-    Stream Loader for various types of video streams.
+    Handles loading and streaming of video sources for real-time processing.
 
-    Suitable for use with `yolo predict source='rtsp://example.com/media.mp4'`, supports RTSP, RTMP, HTTP, and TCP streams.
+    This class manages the input video streams and ensures that frames are efficiently read
+    and made available for processing. It supports various video protocols including RTSP, RTMP, and HTTP.
 
     Attributes:
-        sources (str): The source input paths or URLs for the video streams.
-        imgsz (int): The image size for processing, defaults to 640.
-        vid_stride (int): Video frame-rate stride, defaults to 1.
-        buffer (bool): Whether to buffer input streams, defaults to False.
-        running (bool): Flag to indicate if the streaming thread is running.
-        mode (str): Set to 'stream' indicating real-time capture.
-        imgs (list): List of image frames for each stream.
-        fps (list): List of FPS for each stream.
-        frames (list): List of total frames for each stream.
-        threads (list): List of threads for each stream.
-        shape (list): List of shapes for each stream.
-        caps (list): List of cv2.VideoCapture objects for each stream.
-        bs (int): Batch size for processing.
+        sources (list): List of source URLs or file paths for video streams.
+        image_size (int): The target image size for processing.
+        frame_stride (int): The stride for reading frames from the video streams.
+        buffer_mode (bool): Whether to buffer frames in memory.
+        active (bool): Flag to indicate if the loader is actively streaming.
+        video_captures (list): List of OpenCV video capture objects.
+        frame_queues (list): Lists to hold frames for each video stream.
+        shapes (list): List to store the shape of each video stream.
+        threads (list): List of threads handling video frame reading.
+        frame_rates (list): List of frame rates for each video stream.
 
     Methods:
-        __init__: Initialize the stream loader.
-        update: Read stream frames in daemon thread.
-        close: Close stream loader and release resources.
-        __iter__: Returns an iterator object for the class.
-        __next__: Returns source paths, transformed, and original images for processing.
-        __len__: Return the length of the sources object.
+        __init__: Initialize the StreamLoader with sources and configurations.
+        start_stream: Starts a thread to read frames from each stream.
+        fetch_frames: Reads and buffers frames from the video streams.
+        stop_streams: Stops all active video streams and releases resources.
+        __iter__: Returns an iterator object for processing the frames.
+        __next__: Returns the next batch of frames from the streams.
+        __len__: Returns the number of sources being streamed.
     """
 
-    def __init__(self, sources="file.streams", imgsz=640, vid_stride=1, buffer=False):
-        """Initialize instance variables and check for consistent input stream shapes."""
-        torch.backends.cudnn.benchmark = True  # faster for fixed-size inference
-        self.buffer = buffer  # buffer input streams
-        self.running = True  # running flag for Thread
-        self.mode = "stream"
-        self.imgsz = imgsz
-        self.vid_stride = vid_stride  # video frame-rate stride
+    def __init__(self, sources="streams.txt", image_size=640, frame_stride=1, buffer_mode=False):
+        """Initialize the stream loader with given sources and configurations."""
+        self.sources = self._load_sources(sources)
+        self.image_size = image_size
+        self.frame_stride = frame_stride
+        self.buffer_mode = buffer_mode
+        self.active = True
 
-        sources = Path(sources).read_text().rsplit() if os.path.isfile(sources) else [sources]
-        n = len(sources)
-        self.fps = [0] * n  # frames per second
-        self.frames = [0] * n
-        self.threads = [None] * n
-        self.caps = [None] * n  # video capture objects
-        self.imgs = [[] for _ in range(n)]  # images
-        self.shape = [[] for _ in range(n)]  # image shapes
-        self.sources = [ops.clean_str(x) for x in sources]  # clean source names for later
-        for i, s in enumerate(sources):  # index, source
-            # Start thread to read frames from video stream
-            st = f"{i + 1}/{n}: {s}... "
-            if urlparse(s).hostname in ("www.youtube.com", "youtube.com", "youtu.be"):  # if source is YouTube video
-                # YouTube format i.e. 'https://www.youtube.com/watch?v=Zgi9g1ksQHc' or 'https://youtu.be/LNwODJXcvt4'
-                s = get_best_youtube_url(s)
-            s = eval(s) if s.isnumeric() else s  # i.e. s = '0' local webcam
-            if s == 0 and (is_colab() or is_kaggle()):
-                raise NotImplementedError(
-                    "'source=0' webcam not supported in Colab and Kaggle notebooks. "
-                    "Try running 'source=0' in a local environment."
-                )
-            self.caps[i] = cv2.VideoCapture(s)  # store video capture object
-            if not self.caps[i].isOpened():
-                raise ConnectionError(f"{st}Failed to open {s}")
-            w = int(self.caps[i].get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(self.caps[i].get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = self.caps[i].get(cv2.CAP_PROP_FPS)  # warning: may return 0 or nan
-            self.frames[i] = max(int(self.caps[i].get(cv2.CAP_PROP_FRAME_COUNT)), 0) or float(
-                "inf"
-            )  # infinite stream fallback
-            self.fps[i] = max((fps if math.isfinite(fps) else 0) % 100, 0) or 30  # 30 FPS fallback
+        self.video_captures = []
+        self.frame_queues = []
+        self.shapes = []
+        self.threads = []
+        self.frame_rates = []
 
-            success, im = self.caps[i].read()  # guarantee first frame
-            if not success or im is None:
-                raise ConnectionError(f"{st}Failed to read images from {s}")
-            self.imgs[i].append(im)
-            self.shape[i] = im.shape
-            self.threads[i] = Thread(target=self.update, args=([i, self.caps[i], s]), daemon=True)
-            LOGGER.info(f"{st}Success ✅ ({self.frames[i]} frames of shape {w}x{h} at {self.fps[i]:.2f} FPS)")
-            self.threads[i].start()
-        LOGGER.info("")  # newline
+        self._initialize_streams()
 
-        # Check for common shapes
-        self.bs = self.__len__()
+    def _load_sources(self, sources):
+        """Load video sources from a file or string."""
+        if os.path.isfile(sources):
+            return Path(sources).read_text().splitlines()
+        return [sources]
 
-    def update(self, i, cap, stream):
-        """Read stream `i` frames in daemon thread."""
-        n, f = 0, self.frames[i]  # frame number, frame array
-        while self.running and cap.isOpened() and n < (f - 1):
-            if len(self.imgs[i]) < 30:  # keep a <=30-image buffer
-                n += 1
-                cap.grab()  # .read() = .grab() followed by .retrieve()
-                if n % self.vid_stride == 0:
-                    success, im = cap.retrieve()
-                    if not success:
-                        im = np.zeros(self.shape[i], dtype=np.uint8)
-                        LOGGER.warning("WARNING ⚠️ Video stream unresponsive, please check your IP camera connection.")
-                        cap.open(stream)  # re-open stream if signal was lost
-                    if self.buffer:
-                        self.imgs[i].append(im)
+    def _initialize_streams(self):
+        """Initialize video capture objects and start streaming threads."""
+        for source in self.sources:
+            cap = cv2.VideoCapture(source)
+            if not cap.isOpened():
+                raise ValueError(f"Cannot open video source: {source}")
+            self.video_captures.append(cap)
+            self.frame_queues.append(deque(maxlen=30 if self.buffer_mode else 1))
+            self.shapes.append(self._get_frame_shape(cap))
+            self.frame_rates.append(self._get_frame_rate(cap))
+            thread = Thread(target=self._fetch_frames, args=(cap, len(self.threads)), daemon=True)
+            self.threads.append(thread)
+            thread.start()
+
+    def _get_frame_shape(self, cap):
+        """Retrieve the shape of frames from a video capture object."""
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        return (height, width, 3)
+
+    def _get_frame_rate(self, cap):
+        """Retrieve the frame rate of the video capture."""
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        return fps if fps > 0 else 30  # Default to 30 FPS if not available
+
+    def _fetch_frames(self, cap, index):
+        """Fetch frames from the video capture and store in the queue."""
+        while self.active and cap.isOpened():
+            if len(self.frame_queues[index]) < self.frame_queues[index].maxlen:
+                cap.grab()
+                if cap.get(cv2.CAP_PROP_POS_FRAMES) % self.frame_stride == 0:
+                    success, frame = cap.retrieve()
+                    if success:
+                        self.frame_queues[index].append(frame)
                     else:
-                        self.imgs[i] = [im]
+                        LOGGER.warning(f"Failed to retrieve frame for stream {index}.")
+                        self.frame_queues[index].append(np.zeros(self.shapes[index], dtype=np.uint8))
             else:
-                time.sleep(0.01)  # wait until the buffer is empty
+                time.sleep(0.01)
 
-    def close(self):
-        """Close stream loader and release resources."""
-        self.running = False  # stop flag for Thread
+    def stop_streams(self):
+        """Stop all streaming threads and release resources."""
+        self.active = False
         for thread in self.threads:
             if thread.is_alive():
-                thread.join(timeout=5)  # Add timeout
-        for cap in self.caps:  # Iterate through the stored VideoCapture objects
-            try:
-                cap.release()  # release video capture
-            except Exception as e:
-                LOGGER.warning(f"WARNING ⚠️ Could not release VideoCapture object: {e}")
+                thread.join()
+        for cap in self.video_captures:
+            cap.release()
         cv2.destroyAllWindows()
 
     def __iter__(self):
-        """Iterates through YOLO image feed and re-opens unresponsive streams."""
-        self.count = -1
+        """Return an iterator object for the streams."""
+        self.frame_index = -1
         return self
 
     def __next__(self):
-        """Returns source paths, transformed and original images for processing."""
-        self.count += 1
-
-        images = []
-        for i, x in enumerate(self.imgs):
-            # Wait until a frame is available in each buffer
-            while not x:
-                if not self.threads[i].is_alive() or cv2.waitKey(1) == ord("q"):  # q to quit
-                    self.close()
-                    raise StopIteration
-                time.sleep(1 / min(self.fps))
-                x = self.imgs[i]
-                if not x:
-                    LOGGER.warning(f"WARNING ⚠️ Waiting for stream {i}")
-
-            # Get and remove the first frame from imgs buffer
-            if self.buffer:
-                images.append(x.pop(0))
-
-            # Get the last frame, and clear the rest from the imgs buffer
-            else:
-                images.append(x.pop(-1) if x else np.zeros(self.shape[i], dtype=np.uint8))
-                x.clear()
-
-        return self.sources, images, None, ""
+        """Retrieve the next set of frames from the streams."""
+        self.frame_index += 1
+        frames = []
+        for queue in self.frame_queues:
+            if not queue:
+                raise StopIteration
+            frames.append(queue.popleft() if self.buffer_mode else queue[0])
+        return self.sources, frames
 
     def __len__(self):
-        """Return the length of the sources object."""
-        return len(self.sources)  # 1E12 frames = 32 streams at 30 FPS for 30 years
+        """Return the number of video sources."""
+        return len(self.sources)
 
 
-class LoadScreenshots:
+class ScreenshotLoader:
     """
-    YOLOv8 screenshot dataloader.
+    Manages the loading of screenshots for processing.
 
-    This class manages the loading of screenshot images for processing with YOLOv8.
-    Suitable for use with `yolo predict source=screen`.
+    This class handles the real-time capture of screenshots from a specified screen region
+    and prepares them for processing. It uses the `mss` library for efficient screen capture.
 
     Attributes:
-        source (str): The source input indicating which screen to capture.
-        imgsz (int): The image size for processing, defaults to 640.
-        screen (int): The screen number to capture.
-        left (int): The left coordinate for screen capture area.
-        top (int): The top coordinate for screen capture area.
-        width (int): The width of the screen capture area.
-        height (int): The height of the screen capture area.
-        mode (str): Set to 'stream' indicating real-time capture.
-        frame (int): Counter for captured frames.
-        sct (mss.mss): Screen capture object from `mss` library.
-        bs (int): Batch size, set to 1.
-        monitor (dict): Monitor configuration details.
+        monitor (dict): Monitor configuration for capturing a specific screen area.
+        screen_number (int): The screen index to capture.
+        image_size (int): The target image size for processing.
+        frame_counter (int): Counter to track the number of frames captured.
+        capture_tool (mss.mss): The screen capture tool instance.
 
     Methods:
-        __iter__: Returns an iterator object.
-        __next__: Captures the next screenshot and returns it.
+        __init__: Initializes the screenshot loader with screen configuration.
+        capture_screen: Captures a screenshot and returns it as a numpy array.
+        __iter__: Returns an iterator object for capturing screenshots.
+        __next__: Returns the next screenshot frame.
     """
 
-    def __init__(self, source, imgsz=640):
-        """Source = [screen_number left top width height] (pixels)."""
+    def __init__(self, monitor_config="0 0 0 1920 1080", image_size=640):
+        """Initialize the screenshot loader with monitor configuration."""
         check_requirements("mss")
-        import mss  # noqa
+        import mss
 
-        source, *params = source.split()
-        self.screen, left, top, width, height = 0, None, None, None, None  # default to full screen 0
-        if len(params) == 1:
-            self.screen = int(params[0])
-        elif len(params) == 4:
-            left, top, width, height = (int(x) for x in params)
-        elif len(params) == 5:
-            self.screen, left, top, width, height = (int(x) for x in params)
-        self.imgsz = imgsz
-        self.mode = "stream"
-        self.frame = 0
-        self.sct = mss.mss()
-        self.bs = 1
+        self.screen_number, self.left, self.top, self.width, self.height = map(int, monitor_config.split())
+        self.image_size = image_size
+        self.frame_counter = 0
+        self.capture_tool = mss.mss()
+        self.monitor = self._setup_monitor()
 
-        # Parse monitor shape
-        monitor = self.sct.monitors[self.screen]
-        self.top = monitor["top"] if top is None else (monitor["top"] + top)
-        self.left = monitor["left"] if left is None else (monitor["left"] + left)
-        self.width = width or monitor["width"]
-        self.height = height or monitor["height"]
-        self.monitor = {"left": self.left, "top": self.top, "width": self.width, "height": self.height}
+    def _setup_monitor(self):
+        """Configure the monitor settings for capturing."""
+        screen = self.capture_tool.monitors[self.screen_number]
+        return {
+            "left": screen["left"] + self.left,
+            "top": screen["top"] + self.top,
+            "width": self.width,
+            "height": self.height
+        }
+
+    def capture_screen(self):
+        """Capture a screenshot and return it as a numpy array."""
+        screenshot = self.capture_tool.grab(self.monitor)
+        return np.array(screenshot)[:, :, :3]  # Convert BGRA to BGR
 
     def __iter__(self):
-        """Returns an iterator of the object."""
+        """Return an iterator object for capturing screenshots."""
         return self
 
     def __next__(self):
-        """mss screen capture: get raw pixels from the screen as np array."""
-        im0 = np.asarray(self.sct.grab(self.monitor))[:, :, :3]  # BGRA to BGR
-        s = f"screen {self.screen} (LTWH): {self.left},{self.top},{self.width},{self.height}: "
-
-        self.frame += 1
-        return [str(self.screen)], [im0], None, s  # screen, img, vid_cap, string
+        """Capture and return the next screenshot."""
+        self.frame_counter += 1
+        return self.capture_screen()
 
 
-class LoadImages:
+class ImageLoader:
     """
-    YOLOv8 image/video dataloader.
+    Handles loading of image and video files for batch processing.
 
-    This class manages the loading and pre-processing of image and video data for YOLOv8. It supports loading from
-    various formats, including single image files, video files, and lists of image and video paths.
+    This class manages the loading of images and videos, processes them, and returns
+    the data in a format suitable for further analysis.
 
     Attributes:
-        imgsz (int): Image size, defaults to 640.
         files (list): List of image and video file paths.
-        nf (int): Total number of files (images and videos).
-        video_flag (list): Flags indicating whether a file is a video (True) or an image (False).
-        mode (str): Current mode, 'image' or 'video'.
-        vid_stride (int): Stride for video frame-rate, defaults to 1.
-        bs (int): Batch size, set to 1 for this class.
-        cap (cv2.VideoCapture): Video capture object for OpenCV.
-        frame (int): Frame counter for video.
-        frames (int): Total number of frames in the video.
-        count (int): Counter for iteration, initialized at 0 during `__iter__()`.
+        image_size (int): The target image size for processing.
+        is_video (list): Flags to indicate whether the corresponding file is a video.
+        video_capture (cv2.VideoCapture): Video capture object for handling video files.
 
     Methods:
-        _new_video(path): Create a new cv2.VideoCapture object for a given video path.
+        __init__: Initializes the loader with file paths and configurations.
+        load_files: Loads and processes image and video files.
+        __iter__: Returns an iterator object for the files.
+        __next__: Returns the next image or video frame.
     """
 
-    def __init__(self, path, imgsz=640, vid_stride=1):
-        """Initialize the Dataloader and raise FileNotFoundError if file not found."""
-        parent = None
-        if isinstance(path, str) and Path(path).suffix == ".txt":  # *.txt file with img/vid/dir on each line
-            parent = Path(path).parent
-            path = Path(path).read_text().splitlines()  # list of sources
-        files = []
-        for p in sorted(path) if isinstance(path, (list, tuple)) else [path]:
-            a = str(Path(p).absolute())  # do not use .resolve() https://github.com/ultralytics/ultralytics/issues/2912
-            if "*" in a:
-                files.extend(sorted(glob.glob(a, recursive=True)))  # glob
-            elif os.path.isdir(a):
-                files.extend(sorted(glob.glob(os.path.join(a, "*.*"))))  # dir
-            elif os.path.isfile(a):
-                files.append(a)  # files (absolute or relative to CWD)
-            elif parent and (parent / p).is_file():
-                files.append(str((parent / p).absolute()))  # files (relative to *.txt file parent)
-            else:
-                raise FileNotFoundError(f"{p} does not exist")
+    def __init__(self, file_path, image_size=640, frame_stride=1):
+        """Initialize the image loader with file paths."""
+        self.file_path = file_path
+        self.image_size = image_size
+        self.frame_stride = frame_stride
+        self.files, self.is_video = self._load_files(file_path)
+        self.video_capture = None
+        self._prepare_video_loader()
 
-        images = [x for x in files if x.split(".")[-1].lower() in IMG_FORMATS]
-        videos = [x for x in files if x.split(".")[-1].lower() in VID_FORMATS]
-        ni, nv = len(images), len(videos)
-
-        self.imgsz = imgsz
-        self.files = images + videos
-        self.nf = ni + nv  # number of files
-        self.video_flag = [False] * ni + [True] * nv
-        self.mode = "image"
-        self.vid_stride = vid_stride  # video frame-rate stride
-        self.bs = 1
-        if any(videos):
-            self._new_video(videos[0])  # new video
+    def _load_files(self, file_path):
+        """Load and categorize files as images or videos."""
+        if os.path.isdir(file_path):
+            files = [str(p) for p in Path(file_path).glob("*.*")]
+        elif os.path.isfile(file_path):
+            files = [file_path]
         else:
-            self.cap = None
-        if self.nf == 0:
-            raise FileNotFoundError(
-                f"No images or videos found in {p}. "
-                f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}"
-            )
+            raise FileNotFoundError(f"File or directory not found: {file_path}")
+
+        image_files = [f for f in files if f.split(".")[-1].lower() in IMG_FORMATS]
+        video_files = [f for f in files if f.split(".")[-1].lower() in VID_FORMATS]
+        is_video = [False] * len(image_files) + [True] * len(video_files)
+
+        return image_files + video_files, is_video
+
+    def _prepare_video_loader(self):
+        """Prepare video loader if there are video files."""
+        if any(self.is_video):
+            self.video_capture = cv2.VideoCapture(self.files[self.is_video.index(True)])
+            if not self.video_capture.isOpened():
+                raise ValueError(f"Cannot open video file: {self.files[self.is_video.index(True)]}")
 
     def __iter__(self):
-        """Returns an iterator object for VideoStream or ImageFolder."""
-        self.count = 0
+        """Return an iterator object for the files."""
+        self.index = 0
         return self
 
     def __next__(self):
-        """Return next image, path and metadata from dataset."""
-        if self.count == self.nf:
+        """Return the next image or video frame."""
+        if self.index >= len(self.files):
             raise StopIteration
-        path = self.files[self.count]
 
-        if self.video_flag[self.count]:
-            # Read video
-            self.mode = "video"
-            for _ in range(self.vid_stride):
-                self.cap.grab()
-            success, im0 = self.cap.retrieve()
-            while not success:
-                self.count += 1
-                self.cap.release()
-                if self.count == self.nf:  # last video
-                    raise StopIteration
-                path = self.files[self.count]
-                self._new_video(path)
-                success, im0 = self.cap.read()
-
-            self.frame += 1
-            # im0 = self._cv2_rotate(im0)  # for use if cv2 autorotation is False
-            s = f"video {self.count + 1}/{self.nf} ({self.frame}/{self.frames}) {path}: "
-
+        if self.is_video[self.index]:
+            success, frame = self._get_video_frame()
+            if not success:
+                self.index += 1
+                self.video_capture.release()
+                if self.index < len(self.files):
+                    self._prepare_video_loader()
+                return self.__next__()
+            return self.files[self.index], frame
         else:
-            # Read image
-            self.count += 1
-            im0 = cv2.imread(path)  # BGR
-            if im0 is None:
-                raise FileNotFoundError(f"Image Not Found {path}")
-            s = f"image {self.count}/{self.nf} {path}: "
+            frame = cv2.imread(self.files[self.index])
+            if frame is None:
+                raise ValueError(f"Cannot read image file: {self.files[self.index]}")
+            self.index += 1
+            return self.files[self.index - 1], frame
 
-        return [path], [im0], self.cap, s
-
-    def _new_video(self, path):
-        """Create a new video capture object."""
-        self.frame = 0
-        self.cap = cv2.VideoCapture(path)
-        self.frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) / self.vid_stride)
-
-    def __len__(self):
-        """Returns the number of files in the object."""
-        return self.nf  # number of files
+    def _get_video_frame(self):
+        """Retrieve a frame from the video file."""
+        self.video_capture.grab()
+        for _ in range(self.frame_stride - 1):
+            self.video_capture.grab()
+        return self.video_capture.retrieve()
 
 
-class LoadPilAndNumpy:
+class PilNumpyLoader:
     """
-    Load images from PIL and Numpy arrays for batch processing.
+    Handles loading of images from PIL objects and Numpy arrays.
 
-    This class is designed to manage loading and pre-processing of image data from both PIL and Numpy formats.
-    It performs basic validation and format conversion to ensure that the images are in the required format for
-    downstream processing.
+    This class is designed to load and process images provided as PIL Image objects or Numpy arrays,
+    converting them to a standard format for further processing.
 
     Attributes:
-        paths (list): List of image paths or autogenerated filenames.
-        im0 (list): List of images stored as Numpy arrays.
-        imgsz (int): Image size, defaults to 640.
-        mode (str): Type of data being processed, defaults to 'image'.
-        bs (int): Batch size, equivalent to the length of `im0`.
-        count (int): Counter for iteration, initialized at 0 during `__iter__()`.
+        images (list): List of PIL Image objects or Numpy arrays.
+        image_size (int): The target image size for processing.
+        file_names (list): List of image file names for logging.
 
     Methods:
-        _single_check(im): Validate and format a single image to a Numpy array.
+        __init__: Initializes the loader with images and configurations.
+        process_image: Processes and converts a PIL Image or Numpy array to a standard format.
+        __iter__: Returns an iterator object for the images.
+        __next__: Returns the next processed image.
     """
 
-    def __init__(self, im0, imgsz=640):
-        """Initialize PIL and Numpy Dataloader."""
-        if not isinstance(im0, list):
-            im0 = [im0]
-        self.paths = [getattr(im, "filename", f"image{i}.jpg") for i, im in enumerate(im0)]
-        self.im0 = [self._single_check(im) for im in im0]
-        self.imgsz = imgsz
-        self.mode = "image"
-        # Generate fake paths
-        self.bs = len(self.im0)
+    def __init__(self, images, image_size=640):
+        """Initialize with PIL images or Numpy arrays."""
+        self.images = images if isinstance(images, list) else [images]
+        self.image_size = image_size
+        self.file_names = [self._get_filename(i) for i in range(len(self.images))]
 
-    @staticmethod
-    def _single_check(im):
-        """Validate and format an image to numpy array."""
-        assert isinstance(im, (Image.Image, np.ndarray)), f"Expected PIL/np.ndarray image type, but got {type(im)}"
-        if isinstance(im, Image.Image):
-            if im.mode != "RGB":
-                im = im.convert("RGB")
-            im = np.asarray(im)[:, :, ::-1]
-            im = np.ascontiguousarray(im)  # contiguous
-        return im
+    def _get_filename(self, index):
+        """Generate a filename for an image."""
+        return getattr(self.images[index], "filename", f"image_{index}.jpg")
 
-    def __len__(self):
-        """Returns the length of the 'im0' attribute."""
-        return len(self.im0)
-
-    def __next__(self):
-        """Returns batch paths, images, processed images, None, ''."""
-        if self.count == 1:  # loop only once as it's batch inference
-            raise StopIteration
-        self.count += 1
-        return self.paths, self.im0, None, ""
+    def process_image(self, image):
+        """Convert and prepare the image for processing."""
+        if isinstance(image, Image.Image):
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            image = np.array(image)
+        elif isinstance(image, np.ndarray):
+            pass
+        else:
+            raise ValueError("Unsupported image format.")
+        return image
 
     def __iter__(self):
-        """Enables iteration for class LoadPilAndNumpy."""
-        self.count = 0
+        """Return an iterator object for the images."""
+        self.index = 0
         return self
 
+    def __next__(self):
+        """Return the next processed image."""
+        if self.index >= len(self.images):
+            raise StopIteration
 
-class LoadTensor:
+        processed_image = self.process_image(self.images[self.index])
+        self.index += 1
+        return self.file_names[self.index - 1], processed_image
+
+
+class TensorLoader:
     """
-    Load images from torch.Tensor data.
+    Handles loading of images from PyTorch tensor objects.
 
-    This class manages the loading and pre-processing of image data from PyTorch tensors for further processing.
+    This class manages loading and pre-processing of images provided as PyTorch tensors,
+    ensuring they are properly formatted for further processing.
 
     Attributes:
-        im0 (torch.Tensor): The input tensor containing the image(s).
-        bs (int): Batch size, inferred from the shape of `im0`.
-        mode (str): Current mode, set to 'image'.
-        paths (list): List of image paths or filenames.
-        count (int): Counter for iteration, initialized at 0 during `__iter__()`.
+        tensor (torch.Tensor): Input tensor containing the image data.
+        file_names (list): List of generated file names for the tensors.
 
     Methods:
-        _single_check(im, stride): Validate and possibly modify the input tensor.
+        __init__: Initializes the loader with a tensor.
+        check_tensor: Validates and prepares the tensor for processing.
+        __iter__: Returns an iterator object for the tensor data.
+        __next__: Returns the next batch of processed tensor data.
     """
 
-    def __init__(self, im0) -> None:
-        """Initialize Tensor Dataloader."""
-        self.im0 = self._single_check(im0)
-        self.bs = self.im0.shape[0]
-        self.mode = "image"
-        self.paths = [getattr(im, "filename", f"image{i}.jpg") for i, im in enumerate(im0)]
+    def __init__(self, tensor):
+        """Initialize with a PyTorch tensor."""
+        self.tensor = self._check_tensor(tensor)
+        self.file_names = [f"tensor_image_{i}.jpg" for i in range(tensor.shape[0])]
 
-    @staticmethod
-    def _single_check(im, stride=32):
-        """Validate and format an image to torch.Tensor."""
-        s = (
-            f"WARNING ⚠️ torch.Tensor inputs should be BCHW i.e. shape(1, 3, 640, 640) "
-            f"divisible by stride {stride}. Input shape{tuple(im.shape)} is incompatible."
-        )
-        if len(im.shape) != 4:
-            if len(im.shape) != 3:
-                raise ValueError(s)
-            LOGGER.warning(s)
-            im = im.unsqueeze(0)
-        if im.shape[2] % stride or im.shape[3] % stride:
-            raise ValueError(s)
-        if im.max() > 1.0 + torch.finfo(im.dtype).eps:  # torch.float32 eps is 1.2e-07
-            LOGGER.warning(
-                f"WARNING ⚠️ torch.Tensor inputs should be normalized 0.0-1.0 but max value is {im.max()}. "
-                f"Dividing input by 255."
-            )
-            im = im.float() / 255.0
-
-        return im
+    def _check_tensor(self, tensor):
+        """Validate and prepare the tensor for processing."""
+        if len(tensor.shape) == 3:
+            tensor = tensor.unsqueeze(0)
+        if len(tensor.shape) != 4:
+            raise ValueError("Tensor must have shape (B, C, H, W)")
+        if tensor.max() > 1.0:
+            tensor = tensor.float() / 255.0
+        return tensor
 
     def __iter__(self):
-        """Returns an iterator object."""
-        self.count = 0
+        """Return an iterator object for the tensor data."""
+        self.index = 0
         return self
 
     def __next__(self):
-        """Return next item in the iterator."""
-        if self.count == 1:
+        """Return the next batch of processed tensor data."""
+        if self.index >= len(self.file_names):
             raise StopIteration
-        self.count += 1
-        return self.paths, self.im0, None, ""
 
-    def __len__(self):
-        """Returns the batch size."""
-        return self.bs
+        data = self.tensor[self.index]
+        self.index += 1
+        return self.file_names[self.index - 1], data
 
 
-def autocast_list(source):
-    """Merges a list of source of different types into a list of numpy arrays or PIL images."""
-    files = []
-    for im in source:
-        if isinstance(im, (str, Path)):  # filename or uri
-            files.append(Image.open(requests.get(im, stream=True).raw if str(im).startswith("http") else im))
-        elif isinstance(im, (Image.Image, np.ndarray)):  # PIL or np Image
-            files.append(im)
+def merge_sources(sources):
+    """Merge multiple sources into a list of images for processing."""
+    images = []
+    for source in sources:
+        if isinstance(source, (str, Path)):
+            images.append(Image.open(source))
+        elif isinstance(source, (Image.Image, np.ndarray)):
+            images.append(source)
         else:
-            raise TypeError(
-                f"type {type(im).__name__} is not a supported Ultralytics prediction source type. \n"
-                f"See https://docs.ultralytics.com/modes/predict for supported source types."
-            )
-
-    return files
+            raise TypeError("Unsupported source type.")
+    return images
 
 
-LOADERS = LoadStreams, LoadPilAndNumpy, LoadImages, LoadScreenshots  # tuple
+LOADER_CLASSES = (StreamLoader, PilNumpyLoader, ImageLoader, ScreenshotLoader, TensorLoader)
 
 
-def get_best_youtube_url(url, use_pafy=True):
+def extract_youtube_url(youtube_url, prefer_pafy=True):
     """
-    Retrieves the URL of the best quality MP4 video stream from a given YouTube video.
+    Extract the best video stream URL from a YouTube link.
 
-    This function uses the pafy or yt_dlp library to extract the video info from YouTube. It then finds the highest
-    quality MP4 format that has video codec but no audio codec, and returns the URL of this video stream.
+    This function supports both pafy and yt_dlp libraries to extract video information
+    from YouTube and select the highest quality video stream available.
 
     Args:
-        url (str): The URL of the YouTube video.
-        use_pafy (bool): Use the pafy package, default=True, otherwise use yt_dlp package.
+        youtube_url (str): URL of the YouTube video.
+        prefer_pafy (bool): Whether to prefer the pafy library (True) or yt_dlp (False).
 
     Returns:
-        (str): The URL of the best quality MP4 video stream, or None if no suitable stream is found.
+        str: URL of the best quality video stream.
     """
-    if use_pafy:
-        check_requirements(("pafy", "youtube_dl==2020.12.2"))
-        import pafy  # noqa
-
-        return pafy.new(url).getbestvideo(preftype="mp4").url
+    if prefer_pafy:
+        check_requirements(("pafy", "youtube_dl"))
+        import pafy
+        return pafy.new(youtube_url).getbestvideo(preftype="mp4").url
     else:
         check_requirements("yt-dlp")
         import yt_dlp
-
         with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
-            info_dict = ydl.extract_info(url, download=False)  # extract info
-        for f in reversed(info_dict.get("formats", [])):  # reversed because best is usually last
-            # Find a format with video codec, no audio, *.mp4 extension at least 1920x1080 size
-            good_size = (f.get("width") or 0) >= 1920 or (f.get("height") or 0) >= 1080
-            if good_size and f["vcodec"] != "none" and f["acodec"] == "none" and f["ext"] == "mp4":
-                return f.get("url")
+            info_dict = ydl.extract_info(youtube_url, download=False)
+        for fmt in reversed(info_dict.get("formats", [])):
+            if fmt["vcodec"] != "none" and fmt["acodec"] == "none" and fmt["ext"] == "mp4":
+                if fmt.get("width", 0) >= 1920 or fmt.get("height", 0) >= 1080:
+                    return fmt.get("url")
