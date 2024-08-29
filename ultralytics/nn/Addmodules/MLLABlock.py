@@ -1,3 +1,10 @@
+# This code implements concepts and methods described in the paper:
+# "Demystify Mamba in Vision: A Linear Attention Perspective"
+# 
+# Authors: Dongchen Han, Ziyi Wang, Zhuofan Xia, Yizeng Han, Yifan Pu, Chunjiang Ge, Jun Song, Shiji Song, Bo Zheng, Gao Huang
+# 
+# Original Paper: https://arxiv.org/abs/2405.16605
+
 import torch
 import torch.nn as nn
  
