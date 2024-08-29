@@ -1,31 +1,131 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-
-import math
+import torch
+from torch import nn
+from torch import Tensor
 from typing import Tuple, Type
 
-import torch
-from torch import Tensor, nn
+class EnhancedAttention(nn.Module):
+    """
+    A modified attention mechanism with optional downsampling and multi-head support.
 
-from ultralytics.nn.modules import MLPBlock
+    Attributes:
+        embedding_dim (int): The dimensionality of the input embeddings.
+        num_heads (int): The number of attention heads.
+        downsample_rate (int): Optional downsampling factor.
+    """
+    def __init__(self, embedding_dim: int, num_heads: int, downsample_rate: int = 1) -> None:
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.num_heads = num_heads
+        self.downsample_rate = downsample_rate
+        self.internal_dim = embedding_dim // downsample_rate
+
+        assert self.internal_dim % num_heads == 0, "Number of heads must divide internal dimension evenly."
+
+        self.q_linear = nn.Linear(embedding_dim, self.internal_dim)
+        self.k_linear = nn.Linear(embedding_dim, self.internal_dim)
+        self.v_linear = nn.Linear(embedding_dim, self.internal_dim)
+        self.out_linear = nn.Linear(self.internal_dim, embedding_dim)
+
+    def _split_heads(self, x: Tensor) -> Tensor:
+        """Split tensor into multiple attention heads."""
+        batch_size, seq_len, dim = x.size()
+        x = x.view(batch_size, seq_len, self.num_heads, dim // self.num_heads)
+        return x.permute(0, 2, 1, 3)
+
+    def _combine_heads(self, x: Tensor) -> Tensor:
+        """Combine multi-head outputs into a single tensor."""
+        batch_size, num_heads, seq_len, head_dim = x.size()
+        x = x.permute(0, 2, 1, 3)
+        return x.reshape(batch_size, seq_len, num_heads * head_dim)
+
+    def forward(self, queries: Tensor, keys: Tensor, values: Tensor) -> Tensor:
+        """Forward pass of the attention mechanism."""
+        q = self.q_linear(queries)
+        k = self.k_linear(keys)
+        v = self.v_linear(values)
+
+        q = self._split_heads(q)
+        k = self._split_heads(k)
+        v = self._split_heads(v)
+
+        # Scaled dot-product attention
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.internal_dim ** 0.5)
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+        output = torch.matmul(attn_probs, v)
+
+        output = self._combine_heads(output)
+        return self.out_linear(output)
+
+
+class DualAttentionLayer(nn.Module):
+    """
+    A layer performing self-attention and cross-attention in a two-directional fashion.
+
+    Attributes:
+        embedding_dim (int): Dimensionality of input embeddings.
+        num_heads (int): Number of attention heads.
+        hidden_dim (int): Hidden dimension for MLP layers.
+        activation (Type[nn.Module]): Activation function for MLP layers.
+        downsample_rate (int): Downsampling rate for internal attention dimensions.
+    """
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_heads: int,
+        hidden_dim: int = 2048,
+        activation: Type[nn.Module] = nn.ReLU,
+        downsample_rate: int = 2
+    ) -> None:
+        super().__init__()
+        self.self_attention = EnhancedAttention(embedding_dim, num_heads)
+        self.cross_attention = EnhancedAttention(embedding_dim, num_heads, downsample_rate)
+        self.mlp = nn.Sequential(
+            nn.Linear(embedding_dim, hidden_dim),
+            activation(),
+            nn.Linear(hidden_dim, embedding_dim)
+        )
+        self.layer_norm1 = nn.LayerNorm(embedding_dim)
+        self.layer_norm2 = nn.LayerNorm(embedding_dim)
+        self.layer_norm3 = nn.LayerNorm(embedding_dim)
+
+    def forward(self, queries: Tensor, keys: Tensor, query_pe: Tensor, key_pe: Tensor) -> Tuple[Tensor, Tensor]:
+        """Process queries and keys with self-attention, cross-attention, and MLP."""
+        # Self-attention
+        q = queries + query_pe
+        queries = self.self_attention(q, q, queries)
+        queries = self.layer_norm1(queries)
+
+        # Cross-attention (queries to keys)
+        q = queries + query_pe
+        k = keys + key_pe
+        queries = self.cross_attention(q, k, keys)
+        queries = self.layer_norm2(queries)
+
+        # MLP
+        mlp_out = self.mlp(queries)
+        queries += mlp_out
+        queries = self.layer_norm3(queries)
+
+        # Cross-attention (keys to queries)
+        k = keys + key_pe
+        queries = self.cross_attention(k, queries, queries)
+        keys += queries
+        return queries, keys
 
 
 class TwoWayTransformer(nn.Module):
     """
-    A Two-Way Transformer module that enables the simultaneous attention to both image and query points. This class
-    serves as a specialized transformer decoder that attends to an input image using queries whose positional embedding
-    is supplied. This is particularly useful for tasks like object detection, image segmentation, and point cloud
-    processing.
+    A Transformer model that processes both image and query point embeddings using dual attention layers.
 
     Attributes:
-        depth (int): The number of layers in the transformer.
-        embedding_dim (int): The channel dimension for the input embeddings.
-        num_heads (int): The number of heads for multihead attention.
-        mlp_dim (int): The internal channel dimension for the MLP block.
-        layers (nn.ModuleList): The list of TwoWayAttentionBlock layers that make up the transformer.
-        final_attn_token_to_image (Attention): The final attention layer applied from the queries to the image.
-        norm_final_attn (nn.LayerNorm): The layer normalization applied to the final queries.
+        depth (int): Number of transformer layers.
+        embedding_dim (int): Dimension of embedding vectors.
+        num_heads (int): Number of attention heads.
+        mlp_dim (int): Dimension of MLP hidden layers.
+        layers (nn.ModuleList): List of DualAttentionLayer instances.
+        final_attention (EnhancedAttention): Final attention layer to merge queries with image embeddings.
+        norm_final (nn.LayerNorm): Normalization layer applied to the final queries.
     """
-
     def __init__(
         self,
         depth: int,
@@ -33,242 +133,112 @@ class TwoWayTransformer(nn.Module):
         num_heads: int,
         mlp_dim: int,
         activation: Type[nn.Module] = nn.ReLU,
-        attention_downsample_rate: int = 2,
+        downsample_rate: int = 2
     ) -> None:
-        """
-        A transformer decoder that attends to an input image using queries whose positional embedding is supplied.
-
-        Args:
-          depth (int): number of layers in the transformer
-          embedding_dim (int): the channel dimension for the input embeddings
-          num_heads (int): the number of heads for multihead attention. Must
-            divide embedding_dim
-          mlp_dim (int): the channel dimension internal to the MLP block
-          activation (nn.Module): the activation to use in the MLP block
-        """
         super().__init__()
-        self.depth = depth
-        self.embedding_dim = embedding_dim
-        self.num_heads = num_heads
-        self.mlp_dim = mlp_dim
-        self.layers = nn.ModuleList()
-
-        for i in range(depth):
-            self.layers.append(
-                TwoWayAttentionBlock(
-                    embedding_dim=embedding_dim,
-                    num_heads=num_heads,
-                    mlp_dim=mlp_dim,
-                    activation=activation,
-                    attention_downsample_rate=attention_downsample_rate,
-                    skip_first_layer_pe=(i == 0),
-                )
-            )
-
-        self.final_attn_token_to_image = Attention(embedding_dim, num_heads, downsample_rate=attention_downsample_rate)
-        self.norm_final_attn = nn.LayerNorm(embedding_dim)
+        self.layers = nn.ModuleList([
+            DualAttentionLayer(
+                embedding_dim=embedding_dim,
+                num_heads=num_heads,
+                hidden_dim=mlp_dim,
+                activation=activation,
+                downsample_rate=downsample_rate
+            ) for _ in range(depth)
+        ])
+        self.final_attention = EnhancedAttention(embedding_dim, num_heads, downsample_rate)
+        self.norm_final = nn.LayerNorm(embedding_dim)
 
     def forward(
         self,
-        image_embedding: Tensor,
+        image_embeddings: Tensor,
         image_pe: Tensor,
-        point_embedding: Tensor,
+        point_embeddings: Tensor
     ) -> Tuple[Tensor, Tensor]:
-        """
-        Args:
-          image_embedding (torch.Tensor): image to attend to. Should be shape B x embedding_dim x h x w for any h and w.
-          image_pe (torch.Tensor): the positional encoding to add to the image. Must have same shape as image_embedding.
-          point_embedding (torch.Tensor): the embedding to add to the query points.
-            Must have shape B x N_points x embedding_dim for any N_points.
+        """Process image and point embeddings through transformer layers."""
+        # Flatten and permute image embeddings
+        bs, c, h, w = image_embeddings.size()
+        image_embeddings = image_embeddings.flatten(2).transpose(1, 2)
+        image_pe = image_pe.flatten(2).transpose(1, 2)
 
-        Returns:
-          (torch.Tensor): the processed point_embedding
-          (torch.Tensor): the processed image_embedding
-        """
-        # BxCxHxW -> BxHWxC == B x N_image_tokens x C
-        bs, c, h, w = image_embedding.shape
-        image_embedding = image_embedding.flatten(2).permute(0, 2, 1)
-        image_pe = image_pe.flatten(2).permute(0, 2, 1)
+        queries = point_embeddings
+        keys = image_embeddings
 
-        # Prepare queries
-        queries = point_embedding
-        keys = image_embedding
-
-        # Apply transformer blocks and final layernorm
+        # Apply transformer layers
         for layer in self.layers:
-            queries, keys = layer(
-                queries=queries,
-                keys=keys,
-                query_pe=point_embedding,
-                key_pe=image_pe,
-            )
+            queries, keys = layer(queries, keys, point_embeddings, image_pe)
 
-        # Apply the final attention layer from the points to the image
-        q = queries + point_embedding
+        # Final attention from queries to image
+        q = queries + point_embeddings
         k = keys + image_pe
-        attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys)
-        queries = queries + attn_out
-        queries = self.norm_final_attn(queries)
+        attn_out = self.final_attention(q, k, keys)
+        queries += attn_out
+        queries = self.norm_final(queries)
 
         return queries, keys
 
+"""
+Class EnhancedAttention:
+    Initialize:
+        - embedding_dim: Dimensionality of input embeddings
+        - num_heads: Number of attention heads
+        - downsample_rate: Factor for downsampling dimensions
 
-class TwoWayAttentionBlock(nn.Module):
-    """
-    An attention block that performs both self-attention and cross-attention in two directions: queries to keys and
-    keys to queries. This block consists of four main layers: (1) self-attention on sparse inputs, (2) cross-attention
-    of sparse inputs to dense inputs, (3) an MLP block on sparse inputs, and (4) cross-attention of dense inputs to
-    sparse inputs.
+    Method _split_heads(x):
+        - Reshape x to separate attention heads
+        - Return reshaped tensor
 
-    Attributes:
-        self_attn (Attention): The self-attention layer for the queries.
-        norm1 (nn.LayerNorm): Layer normalization following the first attention block.
-        cross_attn_token_to_image (Attention): Cross-attention layer from queries to keys.
-        norm2 (nn.LayerNorm): Layer normalization following the second attention block.
-        mlp (MLPBlock): MLP block that transforms the query embeddings.
-        norm3 (nn.LayerNorm): Layer normalization following the MLP block.
-        norm4 (nn.LayerNorm): Layer normalization following the third attention block.
-        cross_attn_image_to_token (Attention): Cross-attention layer from keys to queries.
-        skip_first_layer_pe (bool): Whether to skip the positional encoding in the first layer.
-    """
+    Method _combine_heads(x):
+        - Combine separate heads into a single tensor
+        - Return combined tensor
 
-    def __init__(
-        self,
-        embedding_dim: int,
-        num_heads: int,
-        mlp_dim: int = 2048,
-        activation: Type[nn.Module] = nn.ReLU,
-        attention_downsample_rate: int = 2,
-        skip_first_layer_pe: bool = False,
-    ) -> None:
-        """
-        A transformer block with four layers: (1) self-attention of sparse inputs, (2) cross attention of sparse
-        inputs to dense inputs, (3) mlp block on sparse inputs, and (4) cross attention of dense inputs to sparse
-        inputs.
+    Method forward(q, k, v):
+        - Project q, k, v to internal dimensions
+        - Split q, k, v into multiple heads
+        - Compute attention scores
+        - Apply softmax to attention scores
+        - Multiply attention probabilities by values
+        - Recombine heads
+        - Return final output
 
-        Args:
-          embedding_dim (int): the channel dimension of the embeddings
-          num_heads (int): the number of heads in the attention layers
-          mlp_dim (int): the hidden dimension of the mlp block
-          activation (nn.Module): the activation of the mlp block
-          skip_first_layer_pe (bool): skip the PE on the first layer
-        """
-        super().__init__()
-        self.self_attn = Attention(embedding_dim, num_heads)
-        self.norm1 = nn.LayerNorm(embedding_dim)
+Class DualAttentionLayer:
+    Initialize:
+        - embedding_dim: Dimensionality of embeddings
+        - num_heads: Number of attention heads
+        - hidden_dim: Hidden dimension for MLP
+        - activation: Activation function for MLP
+        - downsample_rate: Downsampling factor
 
-        self.cross_attn_token_to_image = Attention(embedding_dim, num_heads, downsample_rate=attention_downsample_rate)
-        self.norm2 = nn.LayerNorm(embedding_dim)
+    Method forward(queries, keys, query_pe, key_pe):
+        - Apply self-attention to queries
+        - Normalize queries
+        - Apply cross-attention from queries to keys
+        - Normalize queries
+        - Pass queries through MLP
+        - Normalize queries
+        - Apply cross-attention from keys to queries
+        - Update keys with attention results
+        - Return updated queries and keys
 
-        self.mlp = MLPBlock(embedding_dim, mlp_dim, activation)
-        self.norm3 = nn.LayerNorm(embedding_dim)
+Class TwoWayTransformer:
+    Initialize:
+        - depth: Number of transformer layers
+        - embedding_dim: Dimensionality of embeddings
+        - num_heads: Number of attention heads
+        - mlp_dim: Hidden dimension for MLP layers
+        - activation: Activation function for MLP
+        - downsample_rate: Downsampling factor
+        - Create list of DualAttentionLayer instances
 
-        self.norm4 = nn.LayerNorm(embedding_dim)
-        self.cross_attn_image_to_token = Attention(embedding_dim, num_heads, downsample_rate=attention_downsample_rate)
+    Method forward(image_embeddings, image_pe, point_embeddings):
+        - Flatten and permute image_embeddings
+        - Set queries to point_embeddings
+        - Set keys to image_embeddings
 
-        self.skip_first_layer_pe = skip_first_layer_pe
+        - For each layer in the list:
+            - Apply layer to queries and keys
 
-    def forward(self, queries: Tensor, keys: Tensor, query_pe: Tensor, key_pe: Tensor) -> Tuple[Tensor, Tensor]:
-        """Apply self-attention and cross-attention to queries and keys and return the processed embeddings."""
+        - Apply final attention from queries to image embeddings
+        - Normalize final queries
+        - Return processed queries and keys
 
-        # Self attention block
-        if self.skip_first_layer_pe:
-            queries = self.self_attn(q=queries, k=queries, v=queries)
-        else:
-            q = queries + query_pe
-            attn_out = self.self_attn(q=q, k=q, v=queries)
-            queries = queries + attn_out
-        queries = self.norm1(queries)
-
-        # Cross attention block, tokens attending to image embedding
-        q = queries + query_pe
-        k = keys + key_pe
-        attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys)
-        queries = queries + attn_out
-        queries = self.norm2(queries)
-
-        # MLP block
-        mlp_out = self.mlp(queries)
-        queries = queries + mlp_out
-        queries = self.norm3(queries)
-
-        # Cross attention block, image embedding attending to tokens
-        q = queries + query_pe
-        k = keys + key_pe
-        attn_out = self.cross_attn_image_to_token(q=k, k=q, v=queries)
-        keys = keys + attn_out
-        keys = self.norm4(keys)
-
-        return queries, keys
-
-
-class Attention(nn.Module):
-    """An attention layer that allows for downscaling the size of the embedding after projection to queries, keys, and
-    values.
-    """
-
-    def __init__(
-        self,
-        embedding_dim: int,
-        num_heads: int,
-        downsample_rate: int = 1,
-    ) -> None:
-        """
-        Initializes the Attention model with the given dimensions and settings.
-
-        Args:
-            embedding_dim (int): The dimensionality of the input embeddings.
-            num_heads (int): The number of attention heads.
-            downsample_rate (int, optional): The factor by which the internal dimensions are downsampled. Defaults to 1.
-
-        Raises:
-            AssertionError: If 'num_heads' does not evenly divide the internal dimension (embedding_dim / downsample_rate).
-        """
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.internal_dim = embedding_dim // downsample_rate
-        self.num_heads = num_heads
-        assert self.internal_dim % num_heads == 0, "num_heads must divide embedding_dim."
-
-        self.q_proj = nn.Linear(embedding_dim, self.internal_dim)
-        self.k_proj = nn.Linear(embedding_dim, self.internal_dim)
-        self.v_proj = nn.Linear(embedding_dim, self.internal_dim)
-        self.out_proj = nn.Linear(self.internal_dim, embedding_dim)
-
-    @staticmethod
-    def _separate_heads(x: Tensor, num_heads: int) -> Tensor:
-        """Separate the input tensor into the specified number of attention heads."""
-        b, n, c = x.shape
-        x = x.reshape(b, n, num_heads, c // num_heads)
-        return x.transpose(1, 2)  # B x N_heads x N_tokens x C_per_head
-
-    @staticmethod
-    def _recombine_heads(x: Tensor) -> Tensor:
-        """Recombine the separated attention heads into a single tensor."""
-        b, n_heads, n_tokens, c_per_head = x.shape
-        x = x.transpose(1, 2)
-        return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
-
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-        """Compute the attention output given the input query, key, and value tensors."""
-
-        # Input projections
-        q = self.q_proj(q)
-        k = self.k_proj(k)
-        v = self.v_proj(v)
-
-        # Separate into heads
-        q = self._separate_heads(q, self.num_heads)
-        k = self._separate_heads(k, self.num_heads)
-        v = self._separate_heads(v, self.num_heads)
-
-        # Attention
-        _, _, _, c_per_head = q.shape
-        attn = q @ k.permute(0, 1, 3, 2)  # B x N_heads x N_tokens x N_tokens
-        attn = attn / math.sqrt(c_per_head)
-        attn = torch.softmax(attn, dim=-1)
-
-        # Get output
-        out = attn @ v
-        out = self._recombine_heads(out)
-        return self.out_proj(out)
+"""
