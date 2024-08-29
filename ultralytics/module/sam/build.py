@@ -1,13 +1,4 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 from functools import partial
-
 import torch
 
 from ultralytics.utils.downloads import attempt_download_asset
@@ -18,67 +9,69 @@ from .modules.tiny_encoder import TinyViT
 from .modules.transformer import TwoWayTransformer
 
 
-def build_sam_vit_h(checkpoint=None):
-    """Build and return a Segment Anything Model (SAM) h-size model."""
-    return _build_sam(
-        encoder_embed_dim=1280,
-        encoder_depth=32,
-        encoder_num_heads=16,
-        encoder_global_attn_indexes=[7, 15, 23, 31],
-        checkpoint=checkpoint,
+def create_sam_vit_h_model(checkpoint=None):
+    """Create and return a high-resolution Segment Anything Model (SAM)."""
+    return initialize_sam_model(
+        embed_dim=1280,
+        depth=32,
+        num_heads=16,
+        global_attn_indexes=[7, 15, 23, 31],
+        checkpoint_path=checkpoint,
     )
 
 
-def build_sam_vit_l(checkpoint=None):
-    """Build and return a Segment Anything Model (SAM) l-size model."""
-    return _build_sam(
-        encoder_embed_dim=1024,
-        encoder_depth=24,
-        encoder_num_heads=16,
-        encoder_global_attn_indexes=[5, 11, 17, 23],
-        checkpoint=checkpoint,
+def create_sam_vit_l_model(checkpoint=None):
+    """Create and return a large Segment Anything Model (SAM)."""
+    return initialize_sam_model(
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        global_attn_indexes=[5, 11, 17, 23],
+        checkpoint_path=checkpoint,
     )
 
 
-def build_sam_vit_b(checkpoint=None):
-    """Build and return a Segment Anything Model (SAM) b-size model."""
-    return _build_sam(
-        encoder_embed_dim=768,
-        encoder_depth=12,
-        encoder_num_heads=12,
-        encoder_global_attn_indexes=[2, 5, 8, 11],
-        checkpoint=checkpoint,
+def create_sam_vit_b_model(checkpoint=None):
+    """Create and return a base Segment Anything Model (SAM)."""
+    return initialize_sam_model(
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        global_attn_indexes=[2, 5, 8, 11],
+        checkpoint_path=checkpoint,
     )
 
 
-def build_mobile_sam(checkpoint=None):
-    """Build and return Mobile Segment Anything Model (Mobile-SAM)."""
-    return _build_sam(
-        encoder_embed_dim=[64, 128, 160, 320],
-        encoder_depth=[2, 2, 6, 2],
-        encoder_num_heads=[2, 4, 5, 10],
-        encoder_global_attn_indexes=None,
-        mobile_sam=True,
-        checkpoint=checkpoint,
+def create_mobile_sam_model(checkpoint=None):
+    """Create and return a Mobile Segment Anything Model (Mobile-SAM)."""
+    return initialize_sam_model(
+        embed_dim=[64, 128, 160, 320],
+        depth=[2, 2, 6, 2],
+        num_heads=[2, 4, 5, 10],
+        global_attn_indexes=None,
+        is_mobile_sam=True,
+        checkpoint_path=checkpoint,
     )
 
 
-def _build_sam(
-    encoder_embed_dim, encoder_depth, encoder_num_heads, encoder_global_attn_indexes, checkpoint=None, mobile_sam=False
+def initialize_sam_model(
+    embed_dim, depth, num_heads, global_attn_indexes, checkpoint_path=None, is_mobile_sam=False
 ):
-    """Builds the selected SAM model architecture."""
-    prompt_embed_dim = 256
-    image_size = 1024
+    """Initialize the SAM model based on specified configurations."""
+    prompt_embedding_dim = 256
+    image_dim = 1024
     vit_patch_size = 16
-    image_embedding_size = image_size // vit_patch_size
-    image_encoder = (
+    embedding_size = image_dim // vit_patch_size
+
+    # Choose between TinyViT or ImageEncoderViT based on mobile_sam flag
+    encoder = (
         TinyViT(
-            img_size=1024,
+            img_size=image_dim,
             in_chans=3,
             num_classes=1000,
-            embed_dims=encoder_embed_dim,
-            depths=encoder_depth,
-            num_heads=encoder_num_heads,
+            embed_dims=embed_dim,
+            depths=depth,
+            num_heads=num_heads,
             window_sizes=[7, 7, 14, 7],
             mlp_ratio=4.0,
             drop_rate=0.0,
@@ -88,73 +81,177 @@ def _build_sam(
             local_conv_size=3,
             layer_lr_decay=0.8,
         )
-        if mobile_sam
+        if is_mobile_sam
         else ImageEncoderViT(
-            depth=encoder_depth,
-            embed_dim=encoder_embed_dim,
-            img_size=image_size,
+            depth=depth,
+            embed_dim=embed_dim,
+            img_size=image_dim,
             mlp_ratio=4,
             norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
-            num_heads=encoder_num_heads,
+            num_heads=num_heads,
             patch_size=vit_patch_size,
             qkv_bias=True,
             use_rel_pos=True,
-            global_attn_indexes=encoder_global_attn_indexes,
+            global_attn_indexes=global_attn_indexes,
             window_size=14,
-            out_chans=prompt_embed_dim,
+            out_chans=prompt_embedding_dim,
         )
     )
-    sam = Sam(
-        image_encoder=image_encoder,
+
+    # Create SAM model components
+    sam_model = Sam(
+        image_encoder=encoder,
         prompt_encoder=PromptEncoder(
-            embed_dim=prompt_embed_dim,
-            image_embedding_size=(image_embedding_size, image_embedding_size),
-            input_image_size=(image_size, image_size),
+            embed_dim=prompt_embedding_dim,
+            image_embedding_size=(embedding_size, embedding_size),
+            input_image_size=(image_dim, image_dim),
             mask_in_chans=16,
         ),
         mask_decoder=MaskDecoder(
             num_multimask_outputs=3,
             transformer=TwoWayTransformer(
                 depth=2,
-                embedding_dim=prompt_embed_dim,
+                embedding_dim=prompt_embedding_dim,
                 mlp_dim=2048,
                 num_heads=8,
             ),
-            transformer_dim=prompt_embed_dim,
+            transformer_dim=prompt_embedding_dim,
             iou_head_depth=3,
             iou_head_hidden_dim=256,
         ),
         pixel_mean=[123.675, 116.28, 103.53],
         pixel_std=[58.395, 57.12, 57.375],
     )
-    if checkpoint is not None:
-        checkpoint = attempt_download_asset(checkpoint)
-        with open(checkpoint, "rb") as f:
-            state_dict = torch.load(f)
-        sam.load_state_dict(state_dict)
-    sam.eval()
-    # sam.load_state_dict(torch.load(checkpoint), strict=True)
-    # sam.eval()
-    return sam
+
+    # Load checkpoint if provided
+    if checkpoint_path:
+        checkpoint_file = attempt_download_asset(checkpoint_path)
+        with open(checkpoint_file, "rb") as file:
+            state_dict = torch.load(file)
+        sam_model.load_state_dict(state_dict)
+
+    sam_model.eval()  # Set model to evaluation mode
+    return sam_model
 
 
-sam_model_map = {
-    "sam_h.pt": build_sam_vit_h,
-    "sam_l.pt": build_sam_vit_l,
-    "sam_b.pt": build_sam_vit_b,
-    "mobile_sam.pt": build_mobile_sam,
+# Mapping of checkpoint files to their corresponding model creation functions
+model_factory_map = {
+    "sam_h.pt": create_sam_vit_h_model,
+    "sam_l.pt": create_sam_vit_l_model,
+    "sam_b.pt": create_sam_vit_b_model,
+    "mobile_sam.pt": create_mobile_sam_model,
 }
 
 
-def build_sam(ckpt="sam_b.pt"):
-    """Build a SAM model specified by ckpt."""
+def build_sam_model(checkpoint_name="sam_b.pt"):
+    """Build the SAM model specified by the checkpoint file name."""
     model_builder = None
-    ckpt = str(ckpt)  # to allow Path ckpt types
-    for k in sam_model_map.keys():
-        if ckpt.endswith(k):
-            model_builder = sam_model_map.get(k)
+    checkpoint_name = str(checkpoint_name)  # Convert checkpoint name to string if it's a Path object
+    
+    # Find the appropriate model creation function based on checkpoint file name
+    for key in model_factory_map.keys():
+        if checkpoint_name.endswith(key):
+            model_builder = model_factory_map[key]
+            break
 
     if not model_builder:
-        raise FileNotFoundError(f"{ckpt} is not a supported SAM model. Available models are: \n {sam_model_map.keys()}")
+        raise FileNotFoundError(f"Unsupported checkpoint file: {checkpoint_name}. Available models: {model_factory_map.keys()}")
 
-    return model_builder(ckpt)
+    return model_builder(checkpoint_name)
+
+
+"""
+# Pseudocode for Building and Loading SAM Models
+
+Define function create_sam_vit_h_model(checkpoint=None):
+    # Create and return a high-resolution SAM model
+    Return initialize_sam_model(
+        embed_dim=1280,
+        depth=32,
+        num_heads=16,
+        global_attn_indexes=[7, 15, 23, 31],
+        checkpoint_path=checkpoint
+    )
+
+Define function create_sam_vit_l_model(checkpoint=None):
+    # Create and return a large SAM model
+    Return initialize_sam_model(
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        global_attn_indexes=[5, 11, 17, 23],
+        checkpoint_path=checkpoint
+    )
+
+Define function create_sam_vit_b_model(checkpoint=None):
+    # Create and return a base SAM model
+    Return initialize_sam_model(
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        global_attn_indexes=[2, 5, 8, 11],
+        checkpoint_path=checkpoint
+    )
+
+Define function create_mobile_sam_model(checkpoint=None):
+    # Create and return a Mobile SAM model
+    Return initialize_sam_model(
+        embed_dim=[64, 128, 160, 320],
+        depth=[2, 2, 6, 2],
+        num_heads=[2, 4, 5, 10],
+        global_attn_indexes=None,
+        is_mobile_sam=True,
+        checkpoint_path=checkpoint
+    )
+
+Define function initialize_sam_model(embed_dim, depth, num_heads, global_attn_indexes, checkpoint_path=None, is_mobile_sam=False):
+    # Initialize the SAM model based on provided parameters
+
+    # Set fixed parameters
+    prompt_embedding_dim = 256
+    image_dim = 1024
+    vit_patch_size = 16
+    embedding_size = image_dim // vit_patch_size
+
+    # Select the appropriate image encoder based on is_mobile_sam flag
+    If is_mobile_sam:
+        Initialize encoder as TinyViT with specified parameters
+    Else:
+        Initialize encoder as ImageEncoderViT with specified parameters
+
+    # Create the SAM model with the encoder, prompt encoder, and mask decoder
+    sam_model = Create Sam model with:
+        - image_encoder
+        - prompt_encoder with prompt_embedding_dim and image_embedding_size
+        - mask_decoder with MaskDecoder and TwoWayTransformer
+        - pixel_mean and pixel_std for normalization
+
+    # Load checkpoint if provided
+    If checkpoint_path is not None:
+        Download checkpoint file
+        Load model state from checkpoint file
+        Set model to evaluation mode
+
+    Return sam_model
+
+# Mapping of checkpoint filenames to model creation functions
+Define model_factory_map as:
+    "sam_h.pt" -> create_sam_vit_h_model
+    "sam_l.pt" -> create_sam_vit_l_model
+    "sam_b.pt" -> create_sam_vit_b_model
+    "mobile_sam.pt" -> create_mobile_sam_model
+
+Define function build_sam_model(checkpoint_name="sam_b.pt"):
+    # Build the SAM model specified by the checkpoint file name
+
+    # Convert checkpoint_name to string if necessary
+    For each key in model_factory_map:
+        If checkpoint_name ends with key:
+            Set model_builder to model_factory_map[key]
+            Break loop
+
+    If model_builder is not found:
+        Raise error with message about unsupported checkpoint file
+
+    Return model_builder with checkpoint_name
+"""
