@@ -3,7 +3,8 @@ import torch
 from einops import rearrange
 import math
  
- 
+__all__ = ['AKConv', 'C2f_AKConv']
+
 class AKConv(nn.Module):
     def __init__(self, inc, outc, num_param, stride=1, bias=None):
         super(AKConv, self).__init__()
