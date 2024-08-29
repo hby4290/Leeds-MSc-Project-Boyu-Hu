@@ -1,3 +1,7 @@
+# This implementation is based on the original EfficientViT code from the following repository:
+# https://github.com/DingXiaoH/RepVGG/blob/main/repvgg.py
+# https://github.com/tensorflow/tpu/issues/494#
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -94,13 +98,6 @@ class top_Block(nn.Module):
 
 
 def drop_path(x, drop_prob: float = 0., training: bool = False):
-    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
-    This is the same as the DropConnect impl I created for EfficientNet, etc networks, however,
-    the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
-    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for
-    changing the layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use
-    'survival rate' as the argument.
-    """
     if drop_prob == 0. or not training:
         return x
     keep_prob = 1 - drop_prob
@@ -218,27 +215,10 @@ class High_FAM(nn.Module):
 
 
 class RepVGGBlock(nn.Module):
-    '''RepVGGBlock is a basic rep-style block, including training and deploy status
-    This code is based on https://github.com/DingXiaoH/RepVGG/blob/main/repvgg.py
-    '''
-
     def __init__(self, in_channels, out_channels, kernel_size=3,
                  stride=1, padding=1, dilation=1, groups=1, padding_mode='zeros', deploy=False, use_se=False):
         super(RepVGGBlock, self).__init__()
         """ Initialization of the class.
-        Args:
-            in_channels (int): Number of channels in the input image
-            out_channels (int): Number of channels produced by the convolution
-            kernel_size (int or tuple): Size of the convolving kernel
-            stride (int or tuple, optional): Stride of the convolution. Default: 1
-            padding (int or tuple, optional): Zero-padding added to both sides of
-                the input. Default: 1
-            dilation (int or tuple, optional): Spacing between kernel elements. Default: 1
-            groups (int, optional): Number of blocked connections from input
-                channels to output channels. Default: 1
-            padding_mode (string, optional): Default: 'zeros'
-            deploy: Whether to be deploy status or training status. Default: False
-            use_se: Whether to use se. Default: False
         """
         self.deploy = deploy
         self.groups = groups
