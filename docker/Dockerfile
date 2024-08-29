@@ -1,4 +1,3 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
 # Builds ultralytics/ultralytics:latest image on DockerHub https://hub.docker.com/r/ultralytics/ultralytics
 # Image is CUDA-optimized for YOLOv8 single/multi-GPU training and inference
 
