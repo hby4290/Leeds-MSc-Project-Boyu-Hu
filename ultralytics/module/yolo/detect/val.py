@@ -1,8 +1,5 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-
 import os
 from pathlib import Path
-
 import numpy as np
 import torch
 
@@ -13,289 +10,291 @@ from ultralytics.utils.checks import check_requirements
 from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from ultralytics.utils.plotting import output_to_target, plot_images
 
-
 class DetectionValidator(BaseValidator):
     """
-    A class extending the BaseValidator class for validation based on a detection model.
-
-    Example:
-        ```python
-        from ultralytics.models.yolo.detect import DetectionValidator
-
-        args = dict(model='yolov8n.pt', data='coco8.yaml')
-        validator = DetectionValidator(args=args)
-        validator()
-        ```
+    A class to validate YOLO object detection models, inheriting from BaseValidator.
     """
 
-    def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
-        """Initialize detection model with necessary variables and settings."""
-        super().__init__(dataloader, save_dir, pbar, args, _callbacks)
-        self.nt_per_class = None
-        self.is_coco = False
-        self.class_map = None
+    def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, callbacks=None):
+        """
+        Initialize the DetectionValidator with necessary parameters.
+
+        Args:
+            dataloader (DataLoader, optional): DataLoader instance for validation.
+            save_dir (Path, optional): Directory to save validation results.
+            pbar (ProgressBar, optional): Progress bar instance.
+            args (dict, optional): Configuration arguments.
+            callbacks (list, optional): List of callback functions.
+        """
+        super().__init__(dataloader, save_dir, pbar, args, callbacks)
+        self._initialize_attributes()
+
+    def _initialize_attributes(self):
+        """Setup initial attributes for validation."""
+        self.num_targets_per_class = None
+        self.is_coco_format = False
+        self.class_mapping = None
         self.args.task = "detect"
         self.metrics = DetMetrics(save_dir=self.save_dir, on_plot=self.on_plot)
-        self.iouv = torch.linspace(0.5, 0.95, 10)  # iou vector for mAP@0.5:0.95
-        self.niou = self.iouv.numel()
-        self.lb = []  # for autolabelling
+        self.iou_values = torch.linspace(0.5, 0.95, 10)
+        self.num_iou_values = self.iou_values.numel()
+        self.label_boxes = []
 
-    def preprocess(self, batch):
-        """Preprocesses batch of images for YOLO training."""
+    def preprocess_batch(self, batch):
+        """
+        Prepare and preprocess the batch for validation.
+
+        Args:
+            batch (dict): Batch containing images and annotations.
+
+        Returns:
+            dict: Preprocessed batch.
+        """
         batch["img"] = batch["img"].to(self.device, non_blocking=True)
         batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 255
-        for k in ["batch_idx", "cls", "bboxes"]:
-            batch[k] = batch[k].to(self.device)
+        for key in ["batch_idx", "cls", "bboxes"]:
+            batch[key] = batch[key].to(self.device)
 
         if self.args.save_hybrid:
             height, width = batch["img"].shape[2:]
-            nb = len(batch["img"])
-            bboxes = batch["bboxes"] * torch.tensor((width, height, width, height), device=self.device)
-            self.lb = (
-                [
-                    torch.cat([batch["cls"][batch["batch_idx"] == i], bboxes[batch["batch_idx"] == i]], dim=-1)
-                    for i in range(nb)
-                ]
-                if self.args.save_hybrid
-                else []
-            )  # for autolabelling
-
+            num_batches = len(batch["img"])
+            boxes = batch["bboxes"] * torch.tensor((width, height, width, height), device=self.device)
+            self.label_boxes = [
+                torch.cat([batch["cls"][batch["batch_idx"] == i], boxes[batch["batch_idx"] == i]], dim=-1)
+                for i in range(num_batches)
+            ] if self.args.save_hybrid else []
+        
         return batch
 
-    def init_metrics(self, model):
-        """Initialize evaluation metrics for YOLO."""
-        val = self.data.get(self.args.split, "")  # validation path
-        self.is_coco = isinstance(val, str) and "coco" in val and val.endswith(f"{os.sep}val2017.txt")  # is COCO
-        self.class_map = converter.coco80_to_coco91_class() if self.is_coco else list(range(1000))
-        self.args.save_json |= self.is_coco and not self.training  # run on final val if training COCO
-        self.names = model.names
-        self.nc = len(model.names)
-        self.metrics.names = self.names
-        self.metrics.plot = self.args.plots
-        self.confusion_matrix = ConfusionMatrix(nc=self.nc, conf=self.args.conf)
-        self.seen = 0
-        self.jdict = []
-        self.stats = dict(tp=[], conf=[], pred_cls=[], target_cls=[])
+    def setup_metrics(self, model):
+        """
+        Initialize metrics for evaluation.
 
-    def get_desc(self):
-        """Return a formatted string summarizing class metrics of YOLO model."""
+        Args:
+            model (nn.Module): YOLO model to evaluate.
+        """
+        validation_path = self.data.get(self.args.split, "")
+        self.is_coco_format = isinstance(validation_path, str) and "coco" in validation_path and validation_path.endswith(f"{os.sep}val2017.txt")
+        self.class_mapping = converter.coco80_to_coco91_class() if self.is_coco_format else list(range(1000))
+        self.args.save_json |= self.is_coco_format and not self.training
+        self.class_names = model.names
+        self.num_classes = len(model.names)
+        self.metrics.names = self.class_names
+        self.metrics.plot = self.args.plots
+        self.confusion_matrix = ConfusionMatrix(num_classes=self.num_classes, confidence_threshold=self.args.conf)
+        self.processed_samples = 0
+        self.json_results = []
+        self.statistics = {"tp": [], "conf": [], "pred_cls": [], "target_cls": []}
+
+    def format_description(self):
+        """
+        Format the description for metrics display.
+
+        Returns:
+            str: Description string.
+        """
         return ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95)")
 
-    def postprocess(self, preds):
-        """Apply Non-maximum suppression to prediction outputs."""
+    def apply_nms(self, predictions):
+        """
+        Apply Non-Maximum Suppression (NMS) to model predictions.
+
+        Args:
+            predictions (Tensor): Model predictions.
+
+        Returns:
+            Tensor: NMS-applied predictions.
+        """
         return ops.non_max_suppression(
-            preds,
+            predictions,
             self.args.conf,
             self.args.iou,
-            labels=self.lb,
+            labels=self.label_boxes,
             multi_label=True,
             agnostic=self.args.single_cls,
             max_det=self.args.max_det,
         )
 
-    def _prepare_batch(self, si, batch):
-        """Prepares a batch of images and annotations for validation."""
-        idx = batch["batch_idx"] == si
+    def prepare_batch_data(self, sample_index, batch):
+        """
+        Prepare batch data for evaluation.
+
+        Args:
+            sample_index (int): Index of the sample in the batch.
+            batch (dict): Batch data containing images and annotations.
+
+        Returns:
+            dict: Prepared batch data.
+        """
+        idx = batch["batch_idx"] == sample_index
         cls = batch["cls"][idx].squeeze(-1)
         bbox = batch["bboxes"][idx]
-        ori_shape = batch["ori_shape"][si]
-        imgsz = batch["img"].shape[2:]
-        ratio_pad = batch["ratio_pad"][si]
+        original_shape = batch["ori_shape"][sample_index]
+        image_size = batch["img"].shape[2:]
+        ratio_padding = batch["ratio_pad"][sample_index]
+
         if len(cls):
-            bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]]  # target boxes
-            ops.scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad)  # native-space labels
-        return dict(cls=cls, bbox=bbox, ori_shape=ori_shape, imgsz=imgsz, ratio_pad=ratio_pad)
+            bbox = ops.xywh2xyxy(bbox) * torch.tensor(image_size, device=self.device)[[1, 0, 1, 0]]
+            ops.scale_boxes(image_size, bbox, original_shape, ratio_pad=ratio_padding)
+        
+        return {
+            "cls": cls,
+            "bbox": bbox,
+            "original_shape": original_shape,
+            "image_size": image_size,
+            "ratio_padding": ratio_padding
+        }
 
-    def _prepare_pred(self, pred, pbatch):
-        """Prepares a batch of images and annotations for validation."""
-        predn = pred.clone()
+    def prepare_predictions(self, predictions, batch_data):
+        """
+        Prepare predictions for evaluation.
+
+        Args:
+            predictions (Tensor): Model predictions.
+            batch_data (dict): Prepared batch data.
+
+        Returns:
+            Tensor: Prepared predictions.
+        """
+        predictions = predictions.clone()
         ops.scale_boxes(
-            pbatch["imgsz"], predn[:, :4], pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"]
-        )  # native-space pred
-        return predn
+            batch_data["image_size"], predictions[:, :4], batch_data["original_shape"], ratio_pad=batch_data["ratio_padding"]
+        )
+        return predictions
 
-    def update_metrics(self, preds, batch):
-        """Metrics."""
-        for si, pred in enumerate(preds):
-            self.seen += 1
-            npr = len(pred)
-            stat = dict(
-                conf=torch.zeros(0, device=self.device),
-                pred_cls=torch.zeros(0, device=self.device),
-                tp=torch.zeros(npr, self.niou, dtype=torch.bool, device=self.device),
-            )
-            pbatch = self._prepare_batch(si, batch)
-            cls, bbox = pbatch.pop("cls"), pbatch.pop("bbox")
-            nl = len(cls)
-            stat["target_cls"] = cls
-            if npr == 0:
-                if nl:
-                    for k in self.stats.keys():
-                        self.stats[k].append(stat[k])
-                    # TODO: obb has not supported confusion_matrix yet.
+    def update_validation_metrics(self, predictions, batch):
+        """
+        Update metrics based on predictions and ground truth data.
+
+        Args:
+            predictions (Tensor): Model predictions.
+            batch (dict): Batch data with ground truth annotations.
+        """
+        for sample_index, pred in enumerate(predictions):
+            self.processed_samples += 1
+            num_predictions = len(pred)
+            stats = {
+                "conf": torch.zeros(0, device=self.device),
+                "pred_cls": torch.zeros(0, device=self.device),
+                "tp": torch.zeros(num_predictions, self.num_iou_values, dtype=torch.bool, device=self.device),
+            }
+            batch_data = self.prepare_batch_data(sample_index, batch)
+            cls, bbox = batch_data.pop("cls"), batch_data.pop("bbox")
+            num_targets = len(cls)
+            stats["target_cls"] = cls
+            
+            if num_predictions == 0:
+                if num_targets:
+                    for key in self.statistics.keys():
+                        self.statistics[key].append(stats[key])
                     if self.args.plots and self.args.task != "obb":
                         self.confusion_matrix.process_batch(detections=None, gt_bboxes=bbox, gt_cls=cls)
                 continue
 
-            # Predictions
             if self.args.single_cls:
                 pred[:, 5] = 0
-            predn = self._prepare_pred(pred, pbatch)
-            stat["conf"] = predn[:, 4]
-            stat["pred_cls"] = predn[:, 5]
+            processed_preds = self.prepare_predictions(pred, batch_data)
+            stats["conf"] = processed_preds[:, 4]
+            stats["pred_cls"] = processed_preds[:, 5]
 
-            # Evaluate
-            if nl:
-                stat["tp"] = self._process_batch(predn, bbox, cls)
-                # TODO: obb has not supported confusion_matrix yet.
+            if num_targets:
+                stats["tp"] = self._evaluate_predictions(processed_preds, bbox, cls)
                 if self.args.plots and self.args.task != "obb":
-                    self.confusion_matrix.process_batch(predn, bbox, cls)
-            for k in self.stats.keys():
-                self.stats[k].append(stat[k])
+                    self.confusion_matrix.process_batch(processed_preds, bbox, cls)
+            
+            for key in self.statistics.keys():
+                self.statistics[key].append(stats[key])
 
-            # Save
             if self.args.save_json:
-                self.pred_to_json(predn, batch["im_file"][si])
+                self.save_predictions_to_json(processed_preds, batch["im_file"][sample_index])
             if self.args.save_txt:
-                file = self.save_dir / "labels" / f'{Path(batch["im_file"][si]).stem}.txt'
-                self.save_one_txt(predn, self.args.save_conf, pbatch["ori_shape"], file)
+                output_file = self.save_dir / "labels" / f'{Path(batch["im_file"][sample_index]).stem}.txt'
+                self.save_predictions_to_txt(processed_preds, self.args.save_conf, batch_data["original_shape"], output_file)
 
-    def finalize_metrics(self, *args, **kwargs):
-        """Set final values for metrics speed and confusion matrix."""
+    def finalize_validation_metrics(self):
+        """
+        Finalize metrics by updating speed and confusion matrix.
+        """
         self.metrics.speed = self.speed
         self.metrics.confusion_matrix = self.confusion_matrix
 
-    def get_stats(self):
-        """Returns metrics statistics and results dictionary."""
-        stats = {k: torch.cat(v, 0).cpu().numpy() for k, v in self.stats.items()}  # to numpy
-        if len(stats) and stats["tp"].any():
-            self.metrics.process(**stats)
-        self.nt_per_class = np.bincount(
-            stats["target_cls"].astype(int), minlength=self.nc
-        )  # number of targets per class
-        return self.metrics.results_dict
-
-    def print_results(self):
-        """Prints training/validation set metrics per class."""
-        pf = "%22s" + "%11i" * 2 + "%11.3g" * len(self.metrics.keys)  # print format
-        LOGGER.info(pf % ("all", self.seen, self.nt_per_class.sum(), *self.metrics.mean_results()))
-        if self.nt_per_class.sum() == 0:
-            LOGGER.warning(f"WARNING ⚠️ no labels found in {self.args.task} set, can not compute metrics without labels")
-
-        # Print results per class
-        if self.args.verbose and not self.training and self.nc > 1 and len(self.stats):
-            for i, c in enumerate(self.metrics.ap_class_index):
-                LOGGER.info(pf % (self.names[c], self.seen, self.nt_per_class[c], *self.metrics.class_result(i)))
-
-        if self.args.plots:
-            for normalize in True, False:
-                self.confusion_matrix.plot(
-                    save_dir=self.save_dir, names=self.names.values(), normalize=normalize, on_plot=self.on_plot
-                )
-
-    def _process_batch(self, detections, gt_bboxes, gt_cls):
+    def compute_statistics(self):
         """
-        Return correct prediction matrix.
-
-        Args:
-            detections (torch.Tensor): Tensor of shape [N, 6] representing detections.
-                Each detection is of the format: x1, y1, x2, y2, conf, class.
-            labels (torch.Tensor): Tensor of shape [M, 5] representing labels.
-                Each label is of the format: class, x1, y1, x2, y2.
+        Compute and process metrics statistics.
 
         Returns:
-            (torch.Tensor): Correct prediction matrix of shape [N, 10] for 10 IoU levels.
+            dict: Processed statistics.
         """
-        iou = box_iou(gt_bboxes, detections[:, :4])
-        return self.match_predictions(detections[:, 5], gt_cls, iou)
-
-    def build_dataset(self, img_path, mode="val", batch=None):
-        """
-        Build YOLO Dataset.
-
-        Args:
-            img_path (str): Path to the folder containing images.
-            mode (str): `train` mode or `val` mode, users are able to customize different augmentations for each mode.
-            batch (int, optional): Size of batches, this is for `rect`. Defaults to None.
-        """
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, stride=self.stride)
-
-    def get_dataloader(self, dataset_path, batch_size):
-        """Construct and return dataloader."""
-        dataset = self.build_dataset(dataset_path, batch=batch_size, mode="val")
-        return build_dataloader(dataset, batch_size, self.args.workers, shuffle=False, rank=-1)  # return dataloader
-
-    def plot_val_samples(self, batch, ni):
-        """Plot validation image samples."""
-        plot_images(
-            batch["img"],
-            batch["batch_idx"],
-            batch["cls"].squeeze(-1),
-            batch["bboxes"],
-            paths=batch["im_file"],
-            fname=self.save_dir / f"val_batch{ni}_labels.jpg",
-            names=self.names,
-            on_plot=self.on_plot,
-        )
-
-    def plot_predictions(self, batch, preds, ni):
-        """Plots predicted bounding boxes on input images and saves the result."""
-        plot_images(
-            batch["img"],
-            *output_to_target(preds, max_det=self.args.max_det),
-            paths=batch["im_file"],
-            fname=self.save_dir / f"val_batch{ni}_pred.jpg",
-            names=self.names,
-            on_plot=self.on_plot,
-        )  # pred
-
-    def save_one_txt(self, predn, save_conf, shape, file):
-        """Save YOLO detections to a txt file in normalized coordinates in a specific format."""
-        gn = torch.tensor(shape)[[1, 0, 1, 0]]  # normalization gain whwh
-        for *xyxy, conf, cls in predn.tolist():
-            xywh = (ops.xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-            line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
-            with open(file, "a") as f:
-                f.write(("%g " * len(line)).rstrip() % line + "\n")
-
-    def pred_to_json(self, predn, filename):
-        """Serialize YOLO predictions to COCO json format."""
-        stem = Path(filename).stem
-        image_id = int(stem) if stem.isnumeric() else stem
-        box = ops.xyxy2xywh(predn[:, :4])  # xywh
-        box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
-        for p, b in zip(predn.tolist(), box.tolist()):
-            self.jdict.append(
-                {
-                    "image_id": image_id,
-                    "category_id": self.class_map[int(p[5])],
-                    "bbox": [round(x, 3) for x in b],
-                    "score": round(p[4], 5),
-                }
-            )
-
-    def eval_json(self, stats):
-        """Evaluates YOLO output in JSON format and returns performance statistics."""
-        if self.args.save_json and self.is_coco and len(self.jdict):
-            anno_json = self.data["path"] / "annotations/instances_val2017.json"  # annotations
-            pred_json = self.save_dir / "predictions.json"  # predictions
-            LOGGER.info(f"\nEvaluating pycocotools mAP using {pred_json} and {anno_json}...")
-            try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-                check_requirements("pycocotools>=2.0.6")
-                from pycocotools.coco import COCO  # noqa
-                from pycocotools.cocoeval import COCOeval  # noqa
-
-                for x in anno_json, pred_json:
-                    assert x.is_file(), f"{x} file not found"
-                anno = COCO(str(anno_json))  # init annotations api
-                pred = anno.loadRes(str(pred_json))  # init predictions api (must pass string, not Path)
-                eval = COCOeval(anno, pred, "bbox")
-                if self.is_coco:
-                    eval.params.imgIds = [int(Path(x).stem) for x in self.dataloader.dataset.im_files]  # images to eval
-                eval.evaluate()
-                eval.accumulate()
-                eval.summarize()
-                stats[self.metrics.keys[-1]], stats[self.metrics.keys[-2]] = eval.stats[:2]  # update mAP50-95 and mAP50
-            except Exception as e:
-                LOGGER.warning(f"pycocotools unable to run: {e}")
+        stats = {key: torch.cat(value, 0).cpu().numpy() for key, value in self.statistics.items()}
+        stats["results"] = self.metrics.result(stats["tp"], stats["conf"], stats["pred_cls"], stats["target_cls"])
         return stats
+
+    def __call__(self):
+        """
+        Run the validation process and compute metrics.
+
+        Returns:
+            dict: Final validation statistics.
+        """
+        for batch in self.dataloader:
+            batch = self.preprocess_batch(batch)
+            predictions = self.model(batch["img"])
+            predictions = self.apply_nms(predictions)
+            self.update_validation_metrics(predictions, batch)
+        self.finalize_validation_metrics()
+        return self.compute_statistics()
+
+"""
+class DetectionValidator(BaseValidator):
+    method __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, callbacks=None):
+        Call parent class initialization method
+        Initialize basic attributes
+
+    method _initialize_attributes(self):
+        Set initialization attributes, such as task type, metrics, etc.
+
+    method preprocess_batch(self, batch):
+        Preprocess batch data (e.g., normalize images, transfer to device)
+        Return preprocessed batch data
+
+    method setup_metrics(self, model):
+        Initialize metrics, set class names, and confusion matrix
+
+    method format_description(self):
+        Format the metrics description string
+        Return description string
+
+    method apply_nms(self, predictions):
+        Apply Non-Maximum Suppression (NMS) to predictions
+        Return NMS-applied predictions
+
+    method prepare_batch_data(self, sample_index, batch):
+        Prepare batch data (e.g., adjust box sizes, process image dimensions)
+        Return prepared data
+
+    method prepare_predictions(self, predictions, batch_data):
+        Prepare prediction results (e.g., adjust box sizes)
+        Return prepared prediction results
+
+    method update_validation_metrics(self, predictions, batch):
+        Update validation metrics (e.g., calculate true positives, false positives)
+        Save predictions to JSON or TXT files (based on configuration)
+
+    method finalize_validation_metrics(self):
+        Finalize metrics calculations, such as speed and confusion matrix
+
+    method compute_statistics(self):
+        Compute and process metric statistics
+        Return processed statistics
+
+    method __call__(self):
+        Execute the validation process
+        Iterate through batches in the dataloader
+        Preprocess batch data
+        Obtain model predictions
+        Apply NMS
+        Update validation metrics
+        Finalize metrics calculations
+        Return final statistics
+
+"""
