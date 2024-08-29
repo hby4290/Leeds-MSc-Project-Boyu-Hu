@@ -66,3 +66,75 @@ def calculate_iou(reference_box, comparison_boxes, iou_threshold=0.9, image_size
 
     # Return indices of boxes that meet the IoU threshold
     return torch.nonzero(iou_values > iou_threshold).flatten()
+
+
+"""
+IMPORT torch library
+
+DEFINE FUNCTION refine_bounding_boxes_to_edges(boxes, image_size, edge_threshold=20):
+    """
+    Adjust bounding boxes to align with the image edges if they are close to the borders.
+
+    Args:
+        boxes: Tensor of bounding boxes with shape (n, 4).
+        image_size: Tuple representing the image size (height, width).
+        edge_threshold: Threshold distance in pixels for adjusting box edges.
+
+    Returns:
+        Tensor of refined bounding boxes.
+    """
+
+    UNPACK image_size into height, width
+
+    ADJUST box coordinates:
+        SET x1 to 0 if it is less than edge_threshold
+        SET y1 to 0 if it is less than edge_threshold
+        SET x2 to image width if it is greater than width - edge_threshold
+        SET y2 to image height if it is greater than height - edge_threshold
+
+    RETURN adjusted boxes
+
+
+DEFINE FUNCTION calculate_iou(reference_box, comparison_boxes, iou_threshold=0.9, image_size=(640, 640), return_raw=False):
+    """
+    Calculate Intersection Over Union (IoU) between a reference box and multiple comparison boxes.
+
+    Args:
+        reference_box: Tensor representing a single bounding box (4,).
+        comparison_boxes: Tensor representing multiple bounding boxes (n, 4).
+        iou_threshold: IoU threshold for filtering.
+        image_size: Tuple representing the image size (height, width).
+        return_raw: Boolean indicating whether to return raw IoU values.
+
+    Returns:
+        Tensor of indices with IoU greater than threshold or raw IoU values.
+    """
+
+    CALL refine_bounding_boxes_to_edges to adjust comparison_boxes to the image borders
+
+    COMPUTE intersection coordinates:
+        inter_x1: Maximum of reference_box x1 and comparison_boxes x1
+        inter_y1: Maximum of reference_box y1 and comparison_boxes y1
+        inter_x2: Minimum of reference_box x2 and comparison_boxes x2
+        inter_y2: Minimum of reference_box y2 and comparison_boxes y2
+
+    CALCULATE intersection area:
+        SET width to inter_x2 - inter_x1 and clamp to non-negative values
+        SET height to inter_y2 - inter_y1 and clamp to non-negative values
+        MULTIPLY width and height to get intersection area
+
+    CALCULATE area of reference_box and comparison_boxes
+
+    COMPUTE union area:
+        ADD reference_box area and comparison_boxes area
+        SUBTRACT intersection area
+
+    COMPUTE IoU:
+        DIVIDE intersection area by union area to get IoU values
+
+    IF return_raw is True:
+        RETURN IoU values
+
+    RETURN indices of comparison_boxes with IoU greater than iou_threshold
+
+"""
