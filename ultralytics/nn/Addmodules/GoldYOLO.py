@@ -1,4 +1,4 @@
-# This implementation is based on the original EfficientViT code from the following repository:
+# This implementation is based on the code from the following repository:
 # https://github.com/DingXiaoH/RepVGG/blob/main/repvgg.py
 # https://github.com/tensorflow/tpu/issues/494#
 
