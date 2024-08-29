@@ -1,8 +1,7 @@
-"""A from-scratch implementation of MobileNetV3 paper ( for educational purposes ).
-Paper
-    Searching for MobileNetV3 - https://arxiv.org/abs/1905.02244v5
-author : shubham.aiengineer@gmail.com
-"""
+# This code implements concepts and methods described in the paper:
+# A from-scratch implementation of MobileNetV3
+# Authors: Shubham Sharma
+# Original Paper: https://arxiv.org/abs/1905.02244v5
 
 import torch
 from torch import nn
