@@ -1,160 +1,156 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-
-from typing import List, Tuple, Type
-
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ultralytics.nn.modules import LayerNorm2d
-
-
-class MaskDecoder(nn.Module):
+# Define a class for the Mask Decoder module
+class MaskDecoderV2(nn.Module):
     """
-    Decoder module for generating masks and their associated quality scores, using a transformer architecture to predict
-    masks given image and prompt embeddings.
-
+    A revised decoder module that utilizes a different architecture to generate segmentation masks.
+    This version uses a unique approach for integrating transformer outputs and decoding masks.
+    
     Attributes:
-        transformer_dim (int): Channel dimension for the transformer module.
-        transformer (nn.Module): The transformer module used for mask prediction.
-        num_multimask_outputs (int): Number of masks to predict for disambiguating masks.
-        iou_token (nn.Embedding): Embedding for the IoU token.
-        num_mask_tokens (int): Number of mask tokens.
-        mask_tokens (nn.Embedding): Embedding for the mask tokens.
-        output_upscaling (nn.Sequential): Neural network sequence for upscaling the output.
-        output_hypernetworks_mlps (nn.ModuleList): Hypernetwork MLPs for generating masks.
-        iou_prediction_head (nn.Module): MLP for predicting mask quality.
+        transform_dim (int): The dimensionality of the transformer's feature space.
+        transformer_network (nn.Module): Transformer network for processing feature embeddings.
+        output_mask_count (int): Number of masks to predict for each object.
+        embedding_layer (nn.Embedding): Embeddings for special tokens including IoU and mask tokens.
+        upsampling_network (nn.Sequential): Network for upsampling mask feature maps.
+        mask_predictors (nn.ModuleList): List of MLPs for predicting individual masks.
+        iou_predictor (nn.Module): MLP for predicting the quality of masks.
     """
 
     def __init__(
         self,
-        *,
-        transformer_dim: int,
-        transformer: nn.Module,
-        num_multimask_outputs: int = 3,
-        activation: Type[nn.Module] = nn.GELU,
-        iou_head_depth: int = 3,
-        iou_head_hidden_dim: int = 256,
+        transform_dim: int,
+        transformer_network: nn.Module,
+        output_mask_count: int = 3,
+        activation_fn: Type[nn.Module] = nn.ReLU,
+        iou_mlp_depth: int = 2,
+        iou_mlp_hidden_dim: int = 128,
     ) -> None:
         """
-        Predicts masks given an image and prompt embeddings, using a transformer architecture.
-
+        Initializes the MaskDecoderV2 instance with the specified parameters.
+        
         Args:
-            transformer_dim (int): the channel dimension of the transformer module
-            transformer (nn.Module): the transformer used to predict masks
-            num_multimask_outputs (int): the number of masks to predict when disambiguating masks
-            activation (nn.Module): the type of activation to use when upscaling masks
-            iou_head_depth (int): the depth of the MLP used to predict mask quality
-            iou_head_hidden_dim (int): the hidden dimension of the MLP used to predict mask quality
+            transform_dim (int): Dimensionality of the transformer's output features.
+            transformer_network (nn.Module): Transformer used for mask prediction.
+            output_mask_count (int): Number of masks to generate for disambiguation.
+            activation_fn (nn.Module): Activation function used in the upsampling network.
+            iou_mlp_depth (int): Depth of the MLP for IoU prediction.
+            iou_mlp_hidden_dim (int): Hidden dimension size for the IoU MLP.
         """
         super().__init__()
-        self.transformer_dim = transformer_dim
-        self.transformer = transformer
+        self.transform_dim = transform_dim
+        self.transformer_network = transformer_network
 
-        self.num_multimask_outputs = num_multimask_outputs
+        self.output_mask_count = output_mask_count
 
-        self.iou_token = nn.Embedding(1, transformer_dim)
-        self.num_mask_tokens = num_multimask_outputs + 1
-        self.mask_tokens = nn.Embedding(self.num_mask_tokens, transformer_dim)
+        self.special_token_embedding = nn.Embedding(1, transform_dim)
+        self.mask_token_embedding = nn.Embedding(output_mask_count + 1, transform_dim)
 
-        self.output_upscaling = nn.Sequential(
-            nn.ConvTranspose2d(transformer_dim, transformer_dim // 4, kernel_size=2, stride=2),
-            LayerNorm2d(transformer_dim // 4),
-            activation(),
-            nn.ConvTranspose2d(transformer_dim // 4, transformer_dim // 8, kernel_size=2, stride=2),
-            activation(),
-        )
-        self.output_hypernetworks_mlps = nn.ModuleList(
-            [MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3) for _ in range(self.num_mask_tokens)]
+        self.upsampling_network = nn.Sequential(
+            nn.ConvTranspose2d(transform_dim, transform_dim // 4, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(transform_dim // 4),
+            activation_fn(),
+            nn.ConvTranspose2d(transform_dim // 4, transform_dim // 8, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(transform_dim // 8),
+            activation_fn(),
         )
 
-        self.iou_prediction_head = MLP(transformer_dim, iou_head_hidden_dim, self.num_mask_tokens, iou_head_depth)
+        self.mask_predictors = nn.ModuleList(
+            [MLP(transform_dim, transform_dim, transform_dim // 8, 2) for _ in range(output_mask_count + 1)]
+        )
+
+        self.iou_predictor = MLP(transform_dim, iou_mlp_hidden_dim, output_mask_count + 1, iou_mlp_depth)
 
     def forward(
         self,
-        image_embeddings: torch.Tensor,
-        image_pe: torch.Tensor,
-        sparse_prompt_embeddings: torch.Tensor,
-        dense_prompt_embeddings: torch.Tensor,
-        multimask_output: bool,
+        img_embeddings: torch.Tensor,
+        img_positional_encodings: torch.Tensor,
+        sparse_prompts: torch.Tensor,
+        dense_prompts: torch.Tensor,
+        multi_mask: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Predict masks given image and prompt embeddings.
-
+        Forward pass for predicting masks given image and prompt embeddings.
+        
         Args:
-            image_embeddings (torch.Tensor): the embeddings from the image encoder
-            image_pe (torch.Tensor): positional encoding with the shape of image_embeddings
-            sparse_prompt_embeddings (torch.Tensor): the embeddings of the points and boxes
-            dense_prompt_embeddings (torch.Tensor): the embeddings of the mask inputs
-            multimask_output (bool): Whether to return multiple masks or a single mask.
+            img_embeddings (torch.Tensor): Embeddings from the image encoder.
+            img_positional_encodings (torch.Tensor): Positional encodings for the image embeddings.
+            sparse_prompts (torch.Tensor): Sparse prompt embeddings (e.g., bounding boxes).
+            dense_prompts (torch.Tensor): Dense prompt embeddings (e.g., mask inputs).
+            multi_mask (bool): Flag to determine if multiple masks should be returned.
 
         Returns:
-            torch.Tensor: batched predicted masks
-            torch.Tensor: batched predictions of mask quality
+            Tuple[torch.Tensor, torch.Tensor]: Predicted masks and their corresponding quality scores.
         """
-        masks, iou_pred = self.predict_masks(
-            image_embeddings=image_embeddings,
-            image_pe=image_pe,
-            sparse_prompt_embeddings=sparse_prompt_embeddings,
-            dense_prompt_embeddings=dense_prompt_embeddings,
+        masks, iou_scores = self._generate_masks(
+            img_embeddings=img_embeddings,
+            img_positional_encodings=img_positional_encodings,
+            sparse_prompts=sparse_prompts,
+            dense_prompts=dense_prompts,
         )
 
-        # Select the correct mask or masks for output
-        mask_slice = slice(1, None) if multimask_output else slice(0, 1)
-        masks = masks[:, mask_slice, :, :]
-        iou_pred = iou_pred[:, mask_slice]
+        if multi_mask:
+            masks = masks[:, 1:, :, :]
+            iou_scores = iou_scores[:, 1:]
+        else:
+            masks = masks[:, :1, :, :]
+            iou_scores = iou_scores[:, :1]
 
-        # Prepare output
-        return masks, iou_pred
+        return masks, iou_scores
 
-    def predict_masks(
+    def _generate_masks(
         self,
-        image_embeddings: torch.Tensor,
-        image_pe: torch.Tensor,
-        sparse_prompt_embeddings: torch.Tensor,
-        dense_prompt_embeddings: torch.Tensor,
+        img_embeddings: torch.Tensor,
+        img_positional_encodings: torch.Tensor,
+        sparse_prompts: torch.Tensor,
+        dense_prompts: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Predicts masks.
+        Internal method to generate masks using the transformer network.
 
-        See 'forward' for more details.
+        Args:
+            img_embeddings (torch.Tensor): Embeddings from the image encoder.
+            img_positional_encodings (torch.Tensor): Positional encodings for image embeddings.
+            sparse_prompts (torch.Tensor): Sparse prompt embeddings.
+            dense_prompts (torch.Tensor): Dense prompt embeddings.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Predicted masks and IoU scores.
         """
-        # Concatenate output tokens
-        output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
-        output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)
-        tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
+        token_embeddings = torch.cat([self.special_token_embedding.weight, self.mask_token_embedding.weight], dim=0)
+        token_embeddings = token_embeddings.unsqueeze(0).expand(sparse_prompts.size(0), -1, -1)
+        combined_tokens = torch.cat((token_embeddings, sparse_prompts), dim=1)
 
-        # Expand per-image data in batch direction to be per-mask
-        src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
-        src = src + dense_prompt_embeddings
-        pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
-        b, c, h, w = src.shape
+        batch_size = img_embeddings.size(0)
+        expanded_embeddings = img_embeddings.repeat(batch_size, 1, 1, 1) + dense_prompts
+        positional_encodings = img_positional_encodings.repeat(batch_size, 1, 1, 1)
 
-        # Run the transformer
-        hs, src = self.transformer(src, pos_src, tokens)
-        iou_token_out = hs[:, 0, :]
-        mask_tokens_out = hs[:, 1 : (1 + self.num_mask_tokens), :]
+        transformer_output, transformer_feats = self.transformer_network(expanded_embeddings, positional_encodings, combined_tokens)
+        
+        iou_token_output = transformer_output[:, 0, :]
+        mask_token_output = transformer_output[:, 1:(1 + self.output_mask_count), :]
 
-        # Upscale mask embeddings and predict masks using the mask tokens
-        src = src.transpose(1, 2).view(b, c, h, w)
-        upscaled_embedding = self.output_upscaling(src)
-        hyper_in_list: List[torch.Tensor] = [
-            self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]) for i in range(self.num_mask_tokens)
-        ]
-        hyper_in = torch.stack(hyper_in_list, dim=1)
-        b, c, h, w = upscaled_embedding.shape
-        masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
+        feature_map = transformer_feats.permute(0, 2, 1).view(batch_size, self.transform_dim, *img_embeddings.shape[2:])
+        upscaled_features = self.upsampling_network(feature_map)
 
-        # Generate mask quality predictions
-        iou_pred = self.iou_prediction_head(iou_token_out)
+        mask_predictions = torch.stack([
+            predictor(mask_token_output[:, i, :]) for i, predictor in enumerate(self.mask_predictors)
+        ], dim=1)
 
-        return masks, iou_pred
+        iou_predictions = self.iou_predictor(iou_token_output)
+
+        return mask_predictions, iou_predictions
 
 
+# Define a class for the Multi-Layer Perceptron (MLP) network
 class MLP(nn.Module):
     """
-    MLP (Multi-Layer Perceptron) model lightly adapted from
-    https://github.com/facebookresearch/MaskFormer/blob/main/mask_former/modeling/transformer/transformer_predictor.py
+    A Multi-Layer Perceptron (MLP) network for various prediction tasks, including mask generation and quality scoring.
+
+    Attributes:
+        layers (nn.ModuleList): List of fully connected layers in the MLP.
+        use_sigmoid (bool): Whether to apply sigmoid activation on the final output.
     """
 
     def __init__(
@@ -162,29 +158,85 @@ class MLP(nn.Module):
         input_dim: int,
         hidden_dim: int,
         output_dim: int,
-        num_layers: int,
-        sigmoid_output: bool = False,
+        num_hidden_layers: int,
+        use_sigmoid: bool = False,
     ) -> None:
         """
-        Initializes the MLP (Multi-Layer Perceptron) model.
+        Initializes the MLP with specified dimensions and configurations.
 
         Args:
-            input_dim (int): The dimensionality of the input features.
-            hidden_dim (int): The dimensionality of the hidden layers.
-            output_dim (int): The dimensionality of the output layer.
-            num_layers (int): The number of hidden layers.
-            sigmoid_output (bool, optional): Apply a sigmoid activation to the output layer. Defaults to False.
+            input_dim (int): Dimensionality of input features.
+            hidden_dim (int): Dimensionality of hidden layers.
+            output_dim (int): Dimensionality of output features.
+            num_hidden_layers (int): Number of hidden layers in the MLP.
+            use_sigmoid (bool): Flag to apply sigmoid activation on the output.
         """
         super().__init__()
-        self.num_layers = num_layers
-        h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
-        self.sigmoid_output = sigmoid_output
+        layers = []
+        prev_dim = input_dim
+        for _ in range(num_hidden_layers):
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        if use_sigmoid:
+            layers.append(nn.Sigmoid())
+        self.network = nn.Sequential(*layers)
 
-    def forward(self, x):
-        """Executes feedforward within the neural network module and applies activation."""
-        for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        if self.sigmoid_output:
-            x = torch.sigmoid(x)
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the MLP network.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after applying the network.
+        """
+        return self.network(x)
+
+"""
+Class MaskDecoder:
+    Initialize:
+        - Set transformer_dim
+        - Set transformer network
+        - Set num_multimask_outputs
+        - Initialize iou_token embedding
+        - Initialize mask_tokens embedding
+        - Define output_upscaling network with transposed convolutions and normalization
+        - Initialize a list of MLPs for predicting masks
+        - Initialize MLP for predicting IoU scores
+
+    Method forward(image_embeddings, image_pe, sparse_prompt_embeddings, dense_prompt_embeddings, multimask_output):
+        - Generate masks and IoU predictions using the predict_masks method
+        - Select masks based on multimask_output flag (single mask or multiple masks)
+        - Return the selected masks and IoU predictions
+
+    Method predict_masks(image_embeddings, image_pe, sparse_prompt_embeddings, dense_prompt_embeddings):
+        - Concatenate IoU token and mask tokens
+        - Expand token embeddings to match batch size
+        - Concatenate tokens with sparse_prompt_embeddings
+        - Repeat image_embeddings and image_pe to match token dimensions
+        - Add dense_prompt_embeddings to image_embeddings
+        - Pass data through transformer network
+        - Extract IoU token and mask tokens outputs
+        - Upscale feature maps using output_upscaling network
+        - Use mask tokens to predict masks with MLPs
+        - Predict IoU scores using the iou_prediction_head MLP
+        - Return predicted masks and IoU scores
+
+Class MLP:
+    Initialize:
+        - Set input_dim
+        - Set hidden_dim
+        - Set output_dim
+        - Set num_layers
+        - Create list of fully connected layers with ReLU activations
+        - If sigmoid_output is True, add a sigmoid activation to the output layer
+
+    Method forward(x):
+        - Pass input x through all layers in the network
+        - If sigmoid_output is True, apply sigmoid activation to the final output
+        - Return the result
+
+"""
