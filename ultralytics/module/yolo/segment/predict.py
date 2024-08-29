@@ -136,3 +136,56 @@ class SegmentationPredictor(DetectionPredictor):
             results.append(result)
 
         return results
+
+"""
+class SegmentationPredictor extends DetectionPredictor:
+
+    # 初始化 SegmentationPredictor 类
+    function __init__(config=DEFAULT_CFG, overrides=null, callbacks=null):
+        # 调用父类构造函数进行初始化
+        call parent constructor with config, overrides, callbacks
+
+        # 设置任务类型为 "segment"
+        self.args.task = "segment"
+
+    # 后处理函数，用于处理预测结果
+    function postprocess(predictions, processed_img, original_imgs):
+        # 应用非极大值抑制，处理检测框
+        processed_predictions = apply non_max_suppression on
+            predictions[0],
+            confidence_threshold=self.args.conf,
+            iou_threshold=self.args.iou,
+            agnostic_nms=self.args.agnostic_nms,
+            max_detections=self.args.max_det,
+            num_classes=length of self.model.names,
+            class_filter=self.args.classes
+
+        # 如果原始图像是张量格式，转换为 NumPy 格式
+        if original_imgs is not a list:
+            original_imgs = convert torch tensor batch to numpy
+
+        results_list = []
+        proto_data = if length of predictions[1] equals 3 then predictions[1][-1] else predictions[1]
+
+        # 遍历每个图像的预测结果
+        for each index, prediction in enumerate(processed_predictions):
+            original_image = original_imgs[index]
+            image_path = self.batch[0][index]
+
+            if prediction is empty:
+                masks = null
+            else:
+                if self.args.retina_masks:
+                    resize prediction boxes to original image size
+                    masks = apply native mask processing on proto_data[index], prediction[:, 6:], prediction[:, :4], original_image shape
+                else:
+                    masks = apply mask processing on proto_data[index], prediction[:, 6:], prediction[:, :4], processed_img shape with upsampling
+                    resize prediction boxes to original image size
+
+            # 创建结果对象并添加到结果列表中
+            result = create Results object with original_image, path=image_path, names=self.model.names, boxes=prediction[:, :6], masks=masks
+            add result to results_list
+
+        return results_list
+
+"""
